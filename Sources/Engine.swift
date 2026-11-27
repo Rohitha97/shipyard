@@ -14,41 +14,109 @@ enum Platform: String, Codable, CaseIterable {
         }
     }
 
-    var buildCommand: String {
-        switch self {
-        // release, not debug: iOS debug builds won't launch from the home screen
-        case .ios: "flutter build ios --release"
-        case .android: "flutter build apk --release"   // fat APK, also runs on emulators
-        case .iosSim: "flutter build ios --simulator --debug"   // simulators can't run release builds
-        }
-    }
-
-    var artifact: String {
-        switch self {
-        case .ios: "build/ios/iphoneos/Runner.app"
-        case .android: "build/app/outputs/flutter-apk/app-release.apk"
-        case .iosSim: "build/ios/iphonesimulator/Runner.app"
-        }
-    }
 }
 
 enum Connection: String {
     case wired = "USB", wireless = "Wi-Fi", simulator = "Simulator"
 }
 
+/// What kind of mobile project a folder is. Only used to pick starting build commands; every command stays editable.
+enum ProjectKind: String, Codable, CaseIterable {
+    case flutter = "Flutter", reactNative = "React Native", ios = "iOS (Xcode)", android = "Android (Gradle)", custom = "Custom"
+}
+
 struct Project: Codable, Identifiable, Equatable {
     var path: String
     var branch = "main"
     var copy = ""          // git-ignored files the build needs, space separated
-    var flutterArgs = ""
+    var flutterArgs = ""   // only read to upgrade projects saved before build commands were editable
     var team = ""          // Apple team ID, when the Xcode project has none
     // Firebase App Distribution, for devices that are not on this network. Optional so older saved projects still load.
     var firebaseAndroid: String?   // Firebase app ID; empty = don't upload
     var firebaseIOS: String?
     var firebaseGroups: String?    // tester groups, comma separated
+    // How to build. nil only in projects saved by older versions, which were all Flutter.
+    var kind: ProjectKind?
+    var prepare: String?                // runs once per commit before any build (fetch dependencies)
+    var commands: [String: String]?     // Platform.rawValue -> build command; empty = platform not built
+    var artifacts: [String: String]?    // Platform.rawValue -> built .app/.apk, relative to the project; * allowed
 
     var id: String { path }
     var name: String { (path as NSString).lastPathComponent }
+
+    func command(_ p: Platform) -> String { commands?[p.rawValue] ?? "" }
+    func artifact(_ p: Platform) -> String { artifacts?[p.rawValue] ?? "" }
+
+    /// Fills prepare/commands/artifacts with the usual ones for `kind`, looking in the folder for names.
+    mutating func applyPreset(_ kind: ProjectKind) {
+        self.kind = kind
+        let fm = FileManager.default
+        func exists(_ rel: String) -> Bool { fm.fileExists(atPath: path + "/" + rel) }
+        func find(in dir: String, ext: String) -> String? {
+            ((try? fm.contentsOfDirectory(atPath: dir.isEmpty ? path : path + "/" + dir)) ?? [])
+                .filter { $0.hasSuffix("." + ext) && !$0.hasPrefix("Pods") }.sorted().first
+        }
+        /// xcodebuild for the Xcode project in `dir`. Assumes the scheme is named after the project.
+        func xcode(_ dir: String, pods: Bool) -> (ios: String, sim: String, out: String)? {
+            guard let proj = find(in: dir, ext: "xcodeproj") else { return nil }
+            let scheme = (proj as NSString).deletingPathExtension
+            let prefix = dir.isEmpty ? "" : dir + "/"
+            let workspace = pods ? scheme + ".xcworkspace" : find(in: dir, ext: "xcworkspace")
+            let container = workspace.map { "-workspace '\(prefix)\($0)'" } ?? "-project '\(prefix)\(proj)'"
+            let base = "xcodebuild \(container) -scheme '\(scheme)' -derivedDataPath build/shipyard"
+            return ("\(base) -configuration Release -sdk iphoneos -allowProvisioningUpdates ${SHIPYARD_TEAM:+DEVELOPMENT_TEAM=$SHIPYARD_TEAM} build",
+                    "\(base) -configuration Release -sdk iphonesimulator build",
+                    "build/shipyard/Build/Products")
+        }
+        switch kind {
+        case .flutter:
+            prepare = "flutter pub get"
+            // release, not debug: iOS debug builds won't launch from the home screen. Simulators can't run release.
+            commands = ["ios": "flutter build ios --release", "android": "flutter build apk --release",
+                        "iosSim": "flutter build ios --simulator --debug"]
+            artifacts = ["ios": "build/ios/iphoneos/Runner.app", "android": "build/app/outputs/flutter-apk/app-release.apk",
+                         "iosSim": "build/ios/iphonesimulator/Runner.app"]
+        case .reactNative:
+            let install = exists("yarn.lock") ? "yarn install" : exists("pnpm-lock.yaml") ? "pnpm install"
+                : exists("bun.lockb") || exists("bun.lock") ? "bun install" : "npm install"
+            prepare = exists("ios/Podfile") ? "\(install) && (cd ios && pod install)" : install
+            commands = [:]; artifacts = [:]
+            if exists("android") {
+                commands?["android"] = "cd android && ./gradlew assembleRelease"
+                artifacts?["android"] = "android/app/build/outputs/apk/release/*.apk"
+            }
+            if let x = xcode("ios", pods: exists("ios/Podfile")) {
+                commands?["ios"] = x.ios; artifacts?["ios"] = x.out + "/Release-iphoneos/*.app"
+                commands?["iosSim"] = x.sim; artifacts?["iosSim"] = x.out + "/Release-iphonesimulator/*.app"
+            }
+        case .ios:
+            prepare = exists("Podfile") ? "pod install" : ""
+            commands = [:]; artifacts = [:]
+            if let x = xcode("", pods: exists("Podfile")) {
+                commands?["ios"] = x.ios; artifacts?["ios"] = x.out + "/Release-iphoneos/*.app"
+                commands?["iosSim"] = x.sim; artifacts?["iosSim"] = x.out + "/Release-iphonesimulator/*.app"
+            }
+        case .android:
+            prepare = ""
+            // debug, because a release APK only installs once the project has a signing config
+            commands = ["android": "./gradlew assembleDebug"]
+            artifacts = ["android": "app/build/outputs/apk/debug/*.apk"]
+        case .custom:
+            prepare = ""; commands = [:]; artifacts = [:]
+        }
+    }
+
+    /// Best guess at what kind of project lives in a folder.
+    static func detect(_ path: String) -> ProjectKind {
+        let fm = FileManager.default
+        func exists(_ rel: String) -> Bool { fm.fileExists(atPath: path + "/" + rel) }
+        let files = (try? fm.contentsOfDirectory(atPath: path)) ?? []
+        if exists("pubspec.yaml") { return .flutter }
+        if let pkg = try? String(contentsOfFile: path + "/package.json", encoding: .utf8), pkg.contains("\"react-native\"") { return .reactNative }
+        if files.contains(where: { $0.hasSuffix(".xcodeproj") || $0.hasSuffix(".xcworkspace") }) { return .ios }
+        if ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"].contains(where: exists) { return .android }
+        return .custom
+    }
 }
 
 /// One built commit. Its artifacts are kept on disk so it can be installed again later.
@@ -115,9 +183,10 @@ final class Engine {
     private var loadedRepo = ""
     private var events: [String] = []      // what happened this pass, for one notification
     private let keepBuilds = 5             // ponytail: fixed count; each kept build is a few hundred MB
-    private func archive(_ sha: String, _ p: Platform) -> String {
-        "\(home)/builds/\(sha)/\(p.rawValue)/" + (p.artifact as NSString).lastPathComponent
-    }
+    /// Folder holding the one kept artifact of a build.
+    private func archive(_ sha: String, _ p: Platform) -> String { "\(home)/builds/\(sha)/\(p.rawValue)" }
+    /// Shell expression for that artifact, whatever the project named it.
+    private func kept(_ sha: String, _ p: Platform) -> String { q(archive(sha, p)) + (p == .android ? "/*.apk" : "/*.app") }
     private var interval: Int { max(15, UserDefaults.standard.object(forKey: "interval") as? Int ?? 60) }
 
     /// `Shipyard --demo` shows sample data and touches nothing: for screenshots and trying the UI.
@@ -133,6 +202,12 @@ final class Engine {
                                 copy: d.string(forKey: "copy") ?? "",
                                 flutterArgs: d.string(forKey: "flutterArgs") ?? "",
                                 team: d.string(forKey: "team") ?? "")]
+        }
+        // Projects saved before build commands were editable were all Flutter.
+        for i in projects.indices where projects[i].commands == nil {
+            let args = projects[i].flutterArgs
+            projects[i].applyPreset(.flutter)
+            if !args.isEmpty { projects[i].commands = projects[i].commands?.mapValues { $0 + " " + args } }
         }
         currentPath = d.string(forKey: "current") ?? ""
         if project == nil { currentPath = projects.first?.path ?? "" }
@@ -154,12 +229,18 @@ final class Engine {
     }
 
     func addProject(_ path: String) {
-        guard FileManager.default.fileExists(atPath: path + "/pubspec.yaml") else {
-            status = "That folder has no pubspec.yaml, so it is not a Flutter project"
-            return
+        if !projects.contains(where: { $0.path == path }) {
+            var project = Project(path: path)
+            project.applyPreset(Project.detect(path))
+            projects.append(project)
         }
-        if !projects.contains(where: { $0.path == path }) { projects.append(Project(path: path)) }
         select(path)
+    }
+
+    /// Settings' project type picker: replaces the build commands with the usual ones for that type.
+    func setKind(_ kind: ProjectKind) {
+        guard !busy, let i = projects.firstIndex(where: { $0.path == currentPath }) else { return }
+        projects[i].applyPreset(kind)
     }
 
     func removeCurrentProject() {
@@ -208,17 +289,17 @@ final class Engine {
     private func upload(_ p: Platform, _ sha: String) async {
         guard let app = firebaseApp(p) else { return }
         status = "Uploading \(p.label) \(sha.prefix(7)) to Firebase…"
-        var file = archive(sha, p)
+        var file = kept(sha, p)
         if p == .ios {
             // Firebase wants an .ipa, which is just the .app zipped inside a Payload folder.
             // ponytail: this is the development-signed build, so it installs only on devices registered in the
-            // Apple developer account. Switch to `flutter build ipa --export-method ad-hoc` if testers need more.
-            let dir = (file as NSString).deletingLastPathComponent
-            _ = await sh("rm -rf Payload Runner.ipa && mkdir Payload && cp -Rc Runner.app Payload/ && zip -qry Runner.ipa Payload; rm -rf Payload", cwd: dir, quiet: true)
-            file = dir + "/Runner.ipa"
+            // Apple developer account. Use an ad hoc export in the iOS build command if testers need more.
+            let dir = archive(sha, p)
+            _ = await sh("rm -rf Payload app.ipa && mkdir Payload && cp -Rc *.app Payload/ && zip -qry app.ipa Payload; rm -rf Payload", cwd: dir, quiet: true)
+            file = q(dir + "/app.ipa")
         }
         let subject = history.first { $0.sha == sha }?.subject ?? ""
-        var cmd = "firebase appdistribution:distribute \(q(file)) --app \(q(app)) --release-notes \(q("\(sha.prefix(7)) \(subject)"))"
+        var cmd = "firebase appdistribution:distribute \(file) --app \(q(app)) --release-notes \(q("\(sha.prefix(7)) \(subject)"))"
         if let groups = active.firebaseGroups, !groups.isEmpty { cmd += " --groups \(q(groups))" }
         let ok = await sh(cmd).ok
         if let i = history.firstIndex(where: { $0.sha == sha }) {
@@ -263,7 +344,8 @@ final class Engine {
 
         // Build only for platforms a connected device is waiting on; offline ones build when they return.
         let wanted = Platform.allCases.filter { p in
-            (devices.contains { $0.platform == p && $0.online && ($0.auto || force) } || firebaseApp(p) != nil)
+            !active.command(p).isEmpty
+                && (devices.contains { $0.platform == p && $0.online && ($0.auto || force) } || firebaseApp(p) != nil)
                 && built[p] != sha && (force || failed[p] != sha)
         }
         if !wanted.isEmpty, await prepare(sha) {
@@ -271,25 +353,19 @@ final class Engine {
         }
         for d in devices where d.needsInstall(built: built[d.platform]) { await install(d.id) }
 
-        let pending = devices.filter { $0.auto && $0.installedSHA != sha }.count
+        let pending = devices.filter { $0.auto && $0.installedSHA != sha && !active.command($0.platform).isEmpty }.count
         status = failed.contains { $0.value == sha } ? "Build failed — see log"
             : pending > 0 ? "\(pending) device\(pending == 1 ? "" : "s") waiting"
             : "Up to date"
     }
 
+    /// Asks Xcode and adb directly, so no particular framework has to be installed.
     private func refreshDevices() async {
-        let r = await sh("flutter devices --machine --device-timeout 10 2>/dev/null", quiet: true)
-        guard r.ok else { return }
-        var seen = Self.parseDevices(r.out)
-        if seen.contains(where: { $0.platform == .ios }) {
-            // Flutter doesn't say how an iPhone is connected; devicectl does.
-            let file = NSTemporaryDirectory() + "shipyard-devices.json"
-            _ = await sh("xcrun devicectl list devices --json-output \(q(file))", quiet: true)
-            let transports = Self.parseTransports((try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data())
-            for i in seen.indices where seen[i].platform == .ios {
-                seen[i].connection = transports[seen[i].id] ?? .wired
-            }
-        }
+        let x = await sh("xcrun xcdevice list --timeout 5 2>/dev/null", quiet: true)
+        let sim = await sh("xcrun simctl list devices booted -j 2>/dev/null", quiet: true)
+        let a = await sh("adb devices -l 2>/dev/null", quiet: true)
+        guard x.ok || sim.ok || a.ok else { return }
+        let seen = Self.parseXcdevice(x.out) + Self.parseSimctl(sim.out) + Self.parseAdb(a.out)
         for i in devices.indices { devices[i].online = false }
         for s in seen {
             if let i = devices.firstIndex(where: { $0.id == s.id }) {
@@ -302,38 +378,45 @@ final class Engine {
         }
     }
 
-    /// iOS/Android devices, simulators and emulators from `flutter devices --machine` output.
-    nonisolated static func parseDevices(_ output: String) -> [Device] {
-        guard let start = output.firstIndex(of: "["),
-              let list = try? JSONSerialization.jsonObject(with: Data(output[start...].utf8)) as? [[String: Any]]
-        else { return [] }
+    private nonisolated static func json(_ output: String, from open: Character) -> Any? {
+        guard let start = output.firstIndex(of: open) else { return nil }
+        return try? JSONSerialization.jsonObject(with: Data(output[start...].utf8))
+    }
+
+    /// Connected iPhones and iPads from `xcrun xcdevice list`.
+    nonisolated static func parseXcdevice(_ output: String) -> [Device] {
+        guard let list = json(output, from: "[") as? [[String: Any]] else { return [] }
         return list.compactMap { d in
-            guard let id = d["id"] as? String, let target = d["targetPlatform"] as? String,
-                  target == "ios" || target.hasPrefix("android")
+            guard let id = d["identifier"] as? String, d["simulator"] as? Bool != true,
+                  d["available"] as? Bool == true, d["platform"] as? String == "com.apple.platform.iphoneos"
             else { return nil }
-            let simulated = d["emulator"] as? Bool == true
-            let platform: Platform = target != "ios" ? .android : simulated ? .iosSim : .ios
-            // adb names Wi-Fi devices by mDNS service or ip:port, USB ones by serial number
-            let connection: Connection = simulated ? .simulator
-                : platform == .android && (id.contains("_adb-tls-connect") || id.contains(":")) ? .wireless : .wired
             let name = (d["name"] as? String ?? id).trimmingCharacters(in: .whitespaces)
-            // Simulators are dev targets you may be running something on: install only when asked.
-            return Device(id: id, name: name, platform: platform, auto: !simulated, online: true, connection: connection)
+            return Device(id: id, name: name, platform: .ios, online: true,
+                          connection: d["interface"] as? String == "usb" ? .wired : .wireless)
         }
     }
 
-    /// UDID -> connection type from `xcrun devicectl list devices --json-output`.
-    nonisolated static func parseTransports(_ json: Data) -> [String: Connection] {
-        guard let root = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
-              let list = (root["result"] as? [String: Any])?["devices"] as? [[String: Any]] else { return [:] }
-        var out: [String: Connection] = [:]
-        for d in list {
-            guard let udid = (d["hardwareProperties"] as? [String: Any])?["udid"] as? String,
-                  let transport = (d["connectionProperties"] as? [String: Any])?["transportType"] as? String
-            else { continue }
-            out[udid] = transport == "wired" ? .wired : .wireless
+    /// Running iOS simulators from `xcrun simctl list devices booted -j`.
+    nonisolated static func parseSimctl(_ output: String) -> [Device] {
+        guard let runtimes = (json(output, from: "{") as? [String: Any])?["devices"] as? [String: [[String: Any]]] else { return [] }
+        return runtimes.filter { $0.key.contains("iOS") }.values.joined().compactMap { d in
+            guard let id = d["udid"] as? String, d["state"] as? String == "Booted" else { return nil }
+            // Simulators are dev targets you may be running something on: install only when asked.
+            return Device(id: id, name: d["name"] as? String ?? id, platform: .iosSim, auto: false, online: true, connection: .simulator)
+        }.sorted { $0.name < $1.name }
+    }
+
+    /// Android phones and running emulators from `adb devices -l`.
+    nonisolated static func parseAdb(_ output: String) -> [Device] {
+        output.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: " ").map(String.init)
+            guard f.count >= 2, f[1] == "device" else { return nil }   // skips the header, "offline" and "unauthorized"
+            let id = f[0], emulator = id.hasPrefix("emulator-")
+            let model = f.first { $0.hasPrefix("model:") }.map { $0.dropFirst(6).replacingOccurrences(of: "_", with: " ") }
+            // adb names Wi-Fi devices by mDNS service or ip:port, USB ones by serial number
+            let connection: Connection = emulator ? .simulator : id.contains("_adb-tls-connect") || id.contains(":") ? .wireless : .wired
+            return Device(id: id, name: model ?? id, platform: .android, auto: !emulator, online: true, connection: connection)
         }
-        return out
     }
 
     private func fetchLatest() async -> Bool {
@@ -364,20 +447,25 @@ final class Engine {
             let dir = (p as NSString).deletingLastPathComponent
             cmd += " && mkdir -p \(q(dir.isEmpty ? "." : dir)) && rsync -a \(q(active.path + "/" + p)) \(q(dir.isEmpty ? "." : dir))/"
         }
-        cmd += " && flutter pub get"
+        if let prep = active.prepare, !prep.isEmpty { cmd += " && ( \(prep) )" }
         let ok = await sh(cmd, cwd: worktree).ok
         if !ok { for p in Platform.allCases { failed[p] = sha } }
         return ok
     }
 
     private func build(_ p: Platform, _ sha: String) async {
+        let command = active.command(p)
+        guard !command.isEmpty else { return }
         status = "Building \(p.label) \(sha.prefix(7))…"
-        var ok = await sh("\(p.buildCommand) \(active.flutterArgs)", cwd: worktree).ok
+        var ok = await sh(command, cwd: worktree).ok
         if ok {
             // Keep a copy per commit for rollback. cp -c clones on APFS, so it costs no time and little disk.
-            let dest = archive(sha, p)
-            let dir = (dest as NSString).deletingLastPathComponent
-            ok = await sh("rm -rf \(q(dir)) && mkdir -p \(q(dir)) && cp -Rc \(q(p.artifact)) \(q(dir))/", cwd: worktree, quiet: true).ok
+            // ponytail: a * in the artifact path must match exactly one file; several matches break the install.
+            let dir = q(archive(sha, p))
+            let artifact = q(active.artifact(p)).replacingOccurrences(of: "*", with: "'*'")
+            let copy = await sh("rm -rf \(dir) && mkdir -p \(dir) && cp -Rc \(artifact) \(dir)/", cwd: worktree, quiet: true)
+            ok = copy.ok
+            if !ok { append("[built, but no artifact at \(active.artifact(p)) — check the path in Settings]\n\(copy.out)\n") }
         }
         if ok { built[p] = sha; failed[p] = nil } else { failed[p] = sha; events.append("\(p.label) build failed") }
         append("[\(p.label) build \(ok ? "succeeded" : "FAILED") for \(sha.prefix(7))]\n")
@@ -402,10 +490,10 @@ final class Engine {
     func install(_ id: String, sha: String? = nil) async {
         guard let i = devices.firstIndex(where: { $0.id == id }), let sha = sha ?? built[devices[i].platform] else { return }
         let d = devices[i]
-        let artifact = q(archive(sha, d.platform))
+        let artifact = kept(sha, d.platform)
         status = "Installing on \(d.name)…"
         devices[i].installing = true
-        // devicectl / adb -r rather than `flutter install`, which uninstalls first and wipes app data
+        // devicectl / adb -r keep the app's data on the device
         let cmd = switch d.platform {
         case .ios: "xcrun devicectl device install app --device \(q(id)) \(artifact)"
         case .iosSim: "xcrun simctl install \(q(id)) \(artifact)"
@@ -489,6 +577,7 @@ final class Engine {
     private func loadDemo() {
         let new = "4f2c9ab81d3e5f60718293a4b5c6d7e8f9012345", old = "a81b3e7c2d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b", older = "0c7d55e9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6"
         projects = [Project(path: "/Users/you/acme-app"), Project(path: "/Users/you/field-notes")]
+        for i in projects.indices { projects[i].applyPreset(.flutter) }
         currentPath = projects[0].path
         branches = ["main", "develop", "feature/checkout-redesign"]
         latestSHA = new
@@ -556,7 +645,7 @@ final class Engine {
 
     private func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
-    /// Runs a command in a login shell, so Homebrew's flutter/adb are on PATH like in Terminal.
+    /// Runs a command in a login shell, so Homebrew's tools are on PATH like in Terminal.
     private func sh(_ command: String, cwd: String? = nil, quiet: Bool = false) async -> (ok: Bool, out: String) {
         if !quiet { append("$ \(command)\n") }
         let p = Process()
@@ -566,7 +655,10 @@ final class Engine {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
         // Supplies a signing team when the Xcode project has none set
-        if !active.team.isEmpty { env["FLUTTER_XCODE_DEVELOPMENT_TEAM"] = active.team }
+        if !active.team.isEmpty {
+            env["FLUTTER_XCODE_DEVELOPMENT_TEAM"] = active.team   // read by flutter
+            env["SHIPYARD_TEAM"] = active.team                    // used by the xcodebuild presets
+        }
         p.environment = env
         let pipe = Pipe()
         p.standardOutput = pipe
@@ -588,34 +680,68 @@ final class Engine {
 
 /// `Shipyard --selftest`: the smallest check that fails if device parsing or the queue rule breaks.
 func selftest() {
-    let json = """
+    let xc = """
     noise before json
-    [{"id":"A1","name":" Phone ","targetPlatform":"ios","emulator":false},
-     {"id":"sim","name":"Sim","targetPlatform":"ios","emulator":true},
-     {"id":"adb-1._adb-tls-connect._tcp","name":"Pixel","targetPlatform":"android-arm64","emulator":false},
-     {"id":"R5GL247","name":"Galaxy","targetPlatform":"android-arm64","emulator":false},
-     {"id":"emulator-5554","name":"Emu","targetPlatform":"android-x64","emulator":true},
-     {"id":"macos","name":"macOS","targetPlatform":"darwin","emulator":false}]
+    [{"identifier":"A1","name":" Phone ","platform":"com.apple.platform.iphoneos","available":true,"interface":"usb","simulator":false},
+     {"identifier":"A2","name":"Pad","platform":"com.apple.platform.iphoneos","available":true,"interface":"network","simulator":false},
+     {"identifier":"A3","name":"Away","platform":"com.apple.platform.iphoneos","available":false,"interface":"network","simulator":false},
+     {"identifier":"W1","name":"Watch","platform":"com.apple.platform.watchos","available":true,"interface":"network","simulator":false},
+     {"identifier":"S1","name":"Sim","platform":"com.apple.platform.iphonesimulator","available":true,"simulator":true}]
     """
-    let d = Engine.parseDevices(json)
-    precondition(d.map(\.id) == ["A1", "sim", "adb-1._adb-tls-connect._tcp", "R5GL247", "emulator-5554"])
-    precondition(d.map(\.platform) == [.ios, .iosSim, .android, .android, .android] && d[0].name == "Phone")
-    precondition(d.map(\.connection) == [.wired, .simulator, .wireless, .wired, .simulator])
-    precondition(d.map(\.auto) == [true, false, true, true, false])   // simulators install only when asked
-    var x = d[0]
+    let i = Engine.parseXcdevice(xc)
+    precondition(i.map(\.id) == ["A1", "A2"] && i[0].name == "Phone" && i.map(\.connection) == [.wired, .wireless])
+
+    let sims = Engine.parseSimctl("""
+    {"devices":{"com.apple.CoreSimulator.SimRuntime.iOS-18-0":[{"name":"iPhone 16","udid":"S1","state":"Booted"},{"name":"Off","udid":"S2","state":"Shutdown"}],
+                "com.apple.CoreSimulator.SimRuntime.watchOS-11-0":[{"name":"Watch","udid":"S3","state":"Booted"}]}}
+    """)
+    precondition(sims.map(\.id) == ["S1"] && sims[0].platform == .iosSim && !sims[0].auto && sims[0].connection == .simulator)
+
+    let adb = Engine.parseAdb("""
+    List of devices attached
+    adb-R5GL._adb-tls-connect._tcp device product:m3q model:SM_S948Q device:m3q transport_id:9
+    R5GL247    device usb:1-1 product:x model:Pixel_9 device:x transport_id:1
+    emulator-5554 device product:sdk model:sdk_gphone64_arm64 device:emu transport_id:2
+    ZX1 unauthorized usb:1-2 transport_id:3
+    """)
+    precondition(adb.map(\.name) == ["SM S948Q", "Pixel 9", "sdk gphone64 arm64"])
+    precondition(adb.map(\.connection) == [.wireless, .wired, .simulator] && adb.map(\.auto) == [true, true, false])
+
+    var x = i[0]
     precondition(x.needsInstall(built: "abc") && !x.needsInstall(built: nil))
     x.installedSHA = "abc"; precondition(!x.needsInstall(built: "abc") && x.needsInstall(built: "def"))
     x.auto = false; precondition(!x.needsInstall(built: "def"))
     x.auto = true; x.online = false; precondition(!x.needsInstall(built: "def"))
-    precondition(Engine.parseDevices("garbage").isEmpty)
+    precondition(Engine.parseXcdevice("garbage").isEmpty && Engine.parseSimctl("").isEmpty && Engine.parseAdb("").isEmpty)
 
-    let ctl = """
-    {"result":{"devices":[
-      {"hardwareProperties":{"udid":"A1"},"connectionProperties":{"transportType":"localNetwork"}},
-      {"hardwareProperties":{"udid":"B2"},"connectionProperties":{"transportType":"wired"}},
-      {"hardwareProperties":{"udid":"C3"},"connectionProperties":{}}]}}
-    """
-    let t = Engine.parseTransports(Data(ctl.utf8))
-    precondition(t == ["A1": .wireless, "B2": .wired])
+    // Project type detection and presets, against throwaway folders
+    let fm = FileManager.default
+    let root = NSTemporaryDirectory() + "shipyard-selftest-\(ProcessInfo.processInfo.processIdentifier)"
+    defer { try? fm.removeItem(atPath: root) }
+    func make(_ name: String, _ files: [String: String]) -> String {
+        for (rel, text) in files {
+            let path = "\(root)/\(name)/\(rel)"
+            try! fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            if rel.hasSuffix("/") { try! fm.createDirectory(atPath: path, withIntermediateDirectories: true) }
+            else { fm.createFile(atPath: path, contents: Data(text.utf8)) }
+        }
+        return "\(root)/\(name)"
+    }
+    let rn = make("rn", ["package.json": "{\"dependencies\":{\"react-native\":\"0.76\"}}", "yarn.lock": "",
+                         "ios/Podfile": "", "ios/Shop.xcodeproj/": "", "android/build.gradle": ""])
+    precondition(Project.detect(make("fl", ["pubspec.yaml": ""])) == .flutter)
+    precondition(Project.detect(rn) == .reactNative)
+    precondition(Project.detect(make("sw", ["Notes.xcodeproj/": ""])) == .ios)
+    precondition(Project.detect(make("kt", ["settings.gradle.kts": ""])) == .android)
+    precondition(Project.detect(make("no", ["README.md": ""])) == .custom)
+    var proj = Project(path: rn)
+    proj.applyPreset(.reactNative)
+    precondition(proj.prepare == "yarn install && (cd ios && pod install)")
+    precondition(proj.command(.ios).contains("-workspace 'ios/Shop.xcworkspace' -scheme 'Shop'") && proj.command(.ios).contains("-sdk iphoneos"))
+    precondition(proj.artifact(.iosSim) == "build/shipyard/Build/Products/Release-iphonesimulator/*.app")
+    precondition(proj.command(.android) == "cd android && ./gradlew assembleRelease")
+    var swift = Project(path: "\(root)/sw")
+    swift.applyPreset(.ios)
+    precondition(swift.command(.ios).contains("-project 'Notes.xcodeproj' -scheme 'Notes'") && swift.command(.android).isEmpty)
     print("selftest ok")
 }

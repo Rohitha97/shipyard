@@ -1,8 +1,8 @@
 # Shipyard
 
-A Mac menu-bar app that watches a Git branch of your Flutter project and, every time something is merged, builds the app and installs it on every phone, tablet and simulator connected to your Mac — over USB or Wi-Fi.
+A Mac menu-bar app that watches a Git branch of your mobile app project and, every time something is merged, builds the app and installs it on every phone, tablet and simulator connected to your Mac — over USB or Wi-Fi.
 
-Merge a pull request, pick up your phone, and the new build is already there.
+Merge a pull request, pick up your phone, and the new build is already there. Works with Flutter, React Native, native iOS (Swift) and native Android (Kotlin) projects, and anything else you can build from a command line.
 
 ![Shipyard's device list: each device shows its connection, installed commit and whether it has the latest build](docs/devices.jpg)
 
@@ -25,10 +25,10 @@ Merge a pull request, pick up your phone, and the new build is already there.
 ## Requirements
 
 - macOS 14 or later
-- [Flutter](https://docs.flutter.dev/get-started/install) on your `PATH`
 - Xcode, for iOS devices and simulators
 - Android SDK platform tools (`adb`), for Android devices
-- A Flutter project whose Git remote is named `origin`
+- Whatever your project builds with (Flutter, Node and CocoaPods, Gradle…) on your `PATH`
+- A project whose Git remote is named `origin`
 
 ## Install
 
@@ -42,7 +42,7 @@ Merge a pull request, pick up your phone, and the new build is already there.
 
 ## Getting started
 
-1. Open Shipyard and choose your Flutter project folder.
+1. Open Shipyard and choose your project folder. Shipyard works out what kind of project it is and fills in the build commands.
 2. Pick the branch to follow in the toolbar (default `main`).
 3. Connect your devices. They appear in the list within a minute; the refresh button checks immediately.
 
@@ -54,6 +54,27 @@ Each device needs a one-time setup before it can receive builds:
 | Android | Turn on USB debugging, or Wireless debugging (Android 11+) and pair once with `adb pair`. |
 | Simulator / emulator | Just start it. Simulators have Auto off by default so a merge doesn't replace an app you are debugging. |
 
+## Project types
+
+When you add a folder, Shipyard looks at what is in it and picks starting build commands. You can change the type, or edit any command, in Settings.
+
+| Type | Detected by | iOS | Android |
+|---|---|---|---|
+| Flutter | `pubspec.yaml` | `flutter build ios` | `flutter build apk` |
+| React Native | `react-native` in `package.json` | `xcodebuild` on `ios/*.xcworkspace` | `./gradlew assembleRelease` in `android/` |
+| iOS (Xcode) | an `.xcodeproj` or `.xcworkspace` | `xcodebuild` | not built |
+| Android (Gradle) | `settings.gradle` or `build.gradle` | not built | `./gradlew assembleDebug` |
+| Custom | anything else | you fill in | you fill in |
+
+Things the starting commands assume, which you may need to adjust:
+
+- **Xcode scheme:** named after the `.xcodeproj`. If yours differs, change `-scheme` in the command.
+- **Android module:** named `app`. Kotlin Multiplatform projects usually use another module, such as `composeApp`.
+- **Native Android builds the debug variant**, because a release APK only installs once the project has a signing config.
+- **Expo projects** need their `ios/` and `android/` folders in the repository, or `npx expo prebuild` added to "Before building".
+
+Flutter projects are the most tested. The other types use standard commands but have had far less real-world use, so expect to adjust a command or two.
+
 ## Settings
 
 Open Settings with the gear button. These apply to the selected project:
@@ -61,7 +82,9 @@ Open Settings with the gear button. These apply to the selected project:
 | Setting | What it is for |
 |---|---|
 | Extra files to copy | Git-ignored files the build needs (fonts, local config), separated by spaces. They are copied from your project folder into the build copy. |
-| Flutter build arguments | Passed to every `flutter build`, for example `--dart-define-from-file=config/local.json`. |
+| Project type | Fills in the usual build commands for that kind of project. |
+| Before building | Runs once per commit before any build, to fetch dependencies (`flutter pub get`, `npm install && (cd ios && pod install)`). |
+| Build and output, per platform | The command that builds each platform and where the resulting `.app` or `.apk` ends up. Leave a build empty to skip that platform. Add your own flags here, for example `--dart-define-from-file=config/local.json`. |
 | Apple team ID | Only needed when the Xcode project has no development team set. |
 | Remote testers | Firebase app IDs and tester groups. See below. |
 
@@ -77,10 +100,11 @@ Every new build is then uploaded and the group is notified. iOS uploads use the 
 
 ## Good to know
 
-- Builds are release builds for physical devices, because iOS debug builds will not launch from the home screen. Simulators get a debug build.
+- Flutter builds are release builds for physical devices, because iOS debug builds will not launch from the home screen. Flutter simulators get a debug build.
 - Installs use `devicectl`, `simctl` and `adb install -r`, which keep the app's data on the device.
 - Rolling a device back to an older build turns its Auto switch off, so the next check does not undo it.
 - Kept builds live in `~/.shipyard/<project>/builds/` and can take a few hundred MB each.
+- Devices are found with Xcode's tools and `adb`, so the list is the same whatever the project is built with.
 - iOS apps can only be built on a Mac, and Shipyard itself is Mac-only.
 
 ## Build from source

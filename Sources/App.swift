@@ -51,7 +51,7 @@ struct ContentView: View {
                 ContentUnavailableView {
                     Label("No project yet", systemImage: "shippingbox")
                 } description: {
-                    Text("Choose a Flutter project folder to start watching it.")
+                    Text("Choose a project folder to start watching it: Flutter, React Native, native iOS or native Android.")
                 } actions: {
                     Button("Choose Project…") { choosing = true }.buttonStyle(.borderedProminent)
                 }
@@ -199,12 +199,14 @@ struct DeviceList: View {
             List {
                 if !online.isEmpty {
                     Section("Connected") {
-                        ForEach(online) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy) }
+                        ForEach(online) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy,
+                                                    supported: engine.project?.command($0.platform).isEmpty == false) }
                     }
                 }
                 if !offline.isEmpty {
                     Section("Offline") {
-                        ForEach(offline) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy) }
+                        ForEach(offline) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy,
+                                                    supported: engine.project?.command($0.platform).isEmpty == false) }
                     }
                 }
             }
@@ -266,12 +268,14 @@ struct DeviceRow: View {
     let device: Device
     let latest: String?
     let busy: Bool
+    let supported: Bool   // false when the project has no build command for this device's platform
 
     private var isLatest: Bool { latest != nil && device.installedSHA == latest }
     private var isLocked: Bool { device.error?.hasPrefix("Locked") == true }
 
     /// A sentence only when the badge alone doesn't say enough.
     private var note: String? {
+        if !supported { return "This project has no \(device.platform.label) build command. Add one in Settings." }
         if let error = device.error { return error }
         guard let latest, device.installedSHA != latest, device.auto, !device.installing else { return nil }
         return device.online ? "Will install \(latest.prefix(7)) on the next check" : "Will get \(latest.prefix(7)) when it reconnects"
@@ -279,6 +283,7 @@ struct DeviceRow: View {
 
     /// The at-a-glance answer to "does this device have the newest build?"
     private var badge: (text: String, icon: String, color: Color) {
+        if !supported { return ("No build", "minus.circle", .secondary) }
         if device.installing { return ("Installing", "arrow.down.circle.fill", .blue) }
         if device.error != nil {
             return isLocked ? ("Locked", "lock.fill", .orange) : ("Failed", "exclamationmark.triangle.fill", .red)
@@ -355,7 +360,7 @@ struct DeviceRow: View {
                 }
             }
             .frame(width: 84, alignment: .trailing)
-                .disabled(busy || !device.online)
+                .disabled(busy || !device.online || !supported)
                 .help(device.online ? "Install the latest build on this device now" : "This device is not connected")
         }
         .padding(.vertical, 5)
@@ -444,12 +449,28 @@ struct SettingsView: View {
                         Text(project.path).lineLimit(1).truncationMode(.head).foregroundStyle(.secondary)
                     }
                     TextField("Extra files to copy", text: binding.copy, prompt: Text("assets/fonts config/local.json"))
-                    TextField("Flutter build arguments", text: binding.flutterArgs, prompt: Text("--dart-define-from-file=config/local.json"))
                     TextField("Apple team ID", text: binding.team, prompt: Text("ABCDE12345"))
                 } header: {
                     Text(project.name)
                 } footer: {
                     Text("Extra files are git-ignored files the build needs, separated by spaces. They are copied from the project folder. The team ID is only needed when the Xcode project has no team set.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section {
+                    Picker("Project type", selection: Binding(get: { project.kind ?? .flutter }, set: { engine.setKind($0) })) {
+                        ForEach(ProjectKind.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }
+                    .disabled(engine.busy)
+                    TextField("Before building", text: binding.prepare.orEmpty, prompt: Text("npm install"), axis: .vertical)
+                    ForEach(Platform.allCases, id: \.self) { p in
+                        TextField("\(p.label) build", text: command(binding, \.commands, p), prompt: Text("not built"), axis: .vertical)
+                        TextField("\(p.label) output", text: command(binding, \.artifacts, p), prompt: Text("path to the built .\(p == .android ? "apk" : "app")"))
+                    }
+                    .font(.callout.monospaced())
+                } header: {
+                    Text("Build commands")
+                } footer: {
+                    Text("Commands run in a clean copy of the commit. Choosing a project type fills in the usual commands and replaces any edits. Leave a platform's build empty to skip it. An output path may use * for a name you don't know. $SHIPYARD_TEAM holds the Apple team ID.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -474,8 +495,14 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520)
+        .frame(width: 640, height: 620)
     }
+}
+
+/// A text binding to one platform's entry in a project's command or output table.
+@MainActor private func command(_ project: Binding<Project>, _ table: WritableKeyPath<Project, [String: String]?>, _ p: Platform) -> Binding<String> {
+    Binding(get: { project.wrappedValue[keyPath: table]?[p.rawValue] ?? "" },
+            set: { project.wrappedValue[keyPath: table] = (project.wrappedValue[keyPath: table] ?? [:]).merging([p.rawValue: $0]) { $1 } })
 }
 
 private extension Binding where Value == String? {
