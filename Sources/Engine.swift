@@ -910,12 +910,12 @@ func selftest() async {
 
     let adb = Engine.parseAdb("""
     List of devices attached
-    adb-R5GL._adb-tls-connect._tcp device product:m3q model:SM_S948Q device:m3q transport_id:9
-    R5GL247    device usb:1-1 product:x model:Pixel_9 device:x transport_id:1
+    adb-ABC123._adb-tls-connect._tcp device product:x model:Galaxy_S24 device:x transport_id:9
+    ABC1234    device usb:1-1 product:x model:Pixel_9 device:x transport_id:1
     emulator-5554 device product:sdk model:sdk_gphone64_arm64 device:emu transport_id:2
     ZX1 unauthorized usb:1-2 transport_id:3
     """)
-    precondition(adb.map(\.name) == ["SM S948Q", "Pixel 9", "sdk gphone64 arm64"])
+    precondition(adb.map(\.name) == ["Galaxy S24", "Pixel 9", "sdk gphone64 arm64"])
     precondition(adb.map(\.connection) == [.wireless, .wired, .simulator] && adb.map(\.auto) == [true, true, false])
 
     var x = i[0]
