@@ -15,7 +15,7 @@ struct ShipyardApp: App {
             MenuContent().environment(engine)
         } label: {
             Image(systemName: engine.busy ? "arrow.triangle.2.circlepath"
-                  : engine.hasFailure ? "exclamationmark.triangle" : "shippingbox")
+                  : engine.hasFailure ? "exclamationmark.triangle" : "sailboat.fill")
         }
         Settings { SettingsView().environment(engine) }
     }
@@ -49,7 +49,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             if engine.project == nil {
                 ContentUnavailableView {
-                    Label("No project yet", systemImage: "shippingbox")
+                    Label("No project yet", systemImage: "sailboat")
                 } description: {
                     Text("Choose a project folder to start watching it: Flutter, React Native, native iOS or native Android.")
                 } actions: {

@@ -10,7 +10,8 @@ BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/Shipya
 
 APP=Shipyard.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/"
 cp "$BIN" "$APP/Contents/MacOS/"
 cat >"$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -19,8 +20,9 @@ cat >"$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleIdentifier</key><string>local.shipyard</string>
   <key>CFBundleName</key><string>Shipyard</string>
   <key>CFBundleExecutable</key><string>Shipyard</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.2</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>Shipyard finds and installs builds on phones connected over Wi-Fi.</string>

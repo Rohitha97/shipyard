@@ -1,3 +1,5 @@
+<img src="docs/icon.png" width="128" alt="Shipyard app icon: a folded-paper boat at sunset">
+
 # Shipyard
 
 A Mac menu-bar app that watches a Git branch of your mobile app project and, every time something is merged, builds the app and installs it on every phone, tablet and simulator connected to your Mac — over USB or Wi-Fi.

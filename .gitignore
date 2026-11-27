@@ -2,4 +2,5 @@
 Shipyard.app/
 *.zip
 .DS_Store
+design/logo/
 firebase-debug.log
