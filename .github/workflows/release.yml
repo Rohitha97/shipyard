@@ -1,0 +1,43 @@
+# Every merge to main that changes the app is built and published as the next patch release.
+# The version is the latest tag with its last number raised by one (v0.2.2 -> v0.2.3).
+# For a bigger jump, push a tag yourself (git tag v0.3.0 && git push origin v0.3.0); numbering continues from it.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [Sources/**, Resources/**, Package.swift, build-app.sh, .github/workflows/release.yml]
+
+permissions:
+  contents: write   # create the tag and the release
+
+concurrency: release   # two merges in a row must not pick the same version
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the tags are needed to work out the next version
+
+      - name: Work out the next version
+        id: version
+        run: |
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+          IFS=. read -r major minor patch <<<"${latest#v}"
+          echo "next=${major:-0}.${minor:-0}.$(( ${patch:--1} + 1 ))" >>"$GITHUB_OUTPUT"
+
+      - name: Build and self-check
+        run: VERSION=${{ steps.version.outputs.next }} ./build-app.sh
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ditto -c -k --keepParent Shipyard.app Shipyard.zip
+          gh release create "v${{ steps.version.outputs.next }}" Shipyard.zip \
+            --target "$GITHUB_SHA" \
+            --title "Shipyard ${{ steps.version.outputs.next }}" \
+            --generate-notes \
+            --notes '**Install:** download `Shipyard.zip`, unzip it and move `Shipyard.app` to Applications. The app is not notarized by Apple, so on first launch right-click it and choose **Open**, or run `xattr -dr com.apple.quarantine /Applications/Shipyard.app`. Runs on macOS 14 or later, Apple Silicon and Intel.'
