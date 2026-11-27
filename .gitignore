@@ -1,0 +1,5 @@
+.build/
+Shipyard.app/
+*.zip
+.DS_Store
+firebase-debug.log
