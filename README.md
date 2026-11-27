@@ -104,8 +104,16 @@ Every new build is then uploaded and the group is notified. iOS uploads use the 
 - Installs use `devicectl`, `simctl` and `adb install -r`, which keep the app's data on the device.
 - Rolling a device back to an older build turns its Auto switch off, so the next check does not undo it.
 - Kept builds live in `~/.shipyard/<project>/builds/` and can take a few hundred MB each.
+- Commands run with the environment of your login shell, including what `~/.zshrc` sets up, and are stopped if they run longer than an hour.
+- Removing a project from Shipyard deletes its build copy and kept builds, never your project folder.
 - Devices are found with Xcode's tools and `adb`, so the list is the same whatever the project is built with.
 - iOS apps can only be built on a Mac, and Shipyard itself is Mac-only.
+
+## Security
+
+- **Shipyard runs your project's build on your Mac.** Anyone who can push to the branch you watch can run code there, through build scripts, Gradle, CocoaPods or npm install hooks. Only watch branches whose contributors you trust.
+- **Remote uploads follow the selected branch.** With Firebase configured, builds of whichever branch is selected go to your testers.
+- **The release is not notarized by Apple**, so macOS cannot vouch for the download. If that matters to you, build from source.
 
 ## Build from source
 

@@ -20,7 +20,7 @@ cat >"$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleName</key><string>Shipyard</string>
   <key>CFBundleExecutable</key><string>Shipyard</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleShortVersionString</key><string>0.2.1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>Shipyard finds and installs builds on phones connected over Wi-Fi.</string>

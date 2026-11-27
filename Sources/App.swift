@@ -439,6 +439,8 @@ struct LogView: View {
 struct SettingsView: View {
     @Environment(Engine.self) private var engine
     @AppStorage("interval") private var interval = 60
+    @State private var pendingKind: ProjectKind?   // type picked but not yet confirmed
+    @State private var confirmingRemoval = false
 
     var body: some View {
         Form {
@@ -457,8 +459,8 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
-                    Picker("Project type", selection: Binding(get: { project.kind ?? .flutter }, set: { engine.setKind($0) })) {
-                        ForEach(ProjectKind.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    Picker("Project type", selection: Binding(get: { project.kind ?? .flutter }, set: { pendingKind = $0 })) {
+                        ForEach(ProjectKind.allCases, id: \.self) { Text($0.label).tag($0) }
                     }
                     .disabled(engine.busy)
                     TextField("Before building", text: binding.prepare.orEmpty, prompt: Text("npm install"), axis: .vertical)
@@ -484,7 +486,7 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
-                    Button("Remove \(project.name) from Shipyard", role: .destructive) { engine.removeCurrentProject() }
+                    Button("Remove \(project.name) from Shipyard", role: .destructive) { confirmingRemoval = true }
                         .disabled(engine.busy)
                 }
             } else {
@@ -496,6 +498,17 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 640, height: 620)
+        .confirmationDialog("Replace the build commands?", isPresented: Binding(get: { pendingKind != nil }, set: { if !$0 { pendingKind = nil } }),
+                            presenting: pendingKind) { kind in
+            Button("Use \(kind.label) Commands", role: .destructive) { engine.setKind(kind) }
+        } message: { kind in
+            Text("The before-building step and every build command and output path are replaced with the usual ones for \(kind.label). Your edits to them are lost.")
+        }
+        .confirmationDialog("Remove \(engine.project?.name ?? "this project") from Shipyard?", isPresented: $confirmingRemoval) {
+            Button("Remove and Delete Kept Builds", role: .destructive) { engine.removeCurrentProject() }
+        } message: {
+            Text("Shipyard's build copy, kept builds and device list for this project are deleted. Your project folder is not touched.")
+        }
     }
 }
 

@@ -22,7 +22,23 @@ enum Connection: String {
 
 /// What kind of mobile project a folder is. Only used to pick starting build commands; every command stays editable.
 enum ProjectKind: String, Codable, CaseIterable {
-    case flutter = "Flutter", reactNative = "React Native", ios = "iOS (Xcode)", android = "Android (Gradle)", custom = "Custom"
+    case flutter, reactNative, ios, android, custom
+
+    var label: String {
+        switch self {
+        case .flutter: "Flutter"
+        case .reactNative: "React Native"
+        case .ios: "iOS (Xcode)"
+        case .android: "Android (Gradle)"
+        case .custom: "Custom"
+        }
+    }
+
+    /// Never fails: version 0.2.0 stored the label, and an unknown value must not make the whole project list unreadable.
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = ProjectKind(rawValue: value) ?? Self.allCases.first { $0.label == value } ?? .custom
+    }
 }
 
 struct Project: Codable, Identifiable, Equatable {
@@ -40,6 +56,7 @@ struct Project: Codable, Identifiable, Equatable {
     var prepare: String?                // runs once per commit before any build (fetch dependencies)
     var commands: [String: String]?     // Platform.rawValue -> build command; empty = platform not built
     var artifacts: [String: String]?    // Platform.rawValue -> built .app/.apk, relative to the project; * allowed
+    var dir: String?                    // folder under ~/.shipyard; nil in older projects, which use the folder name
 
     var id: String { path }
     var name: String { (path as NSString).lastPathComponent }
@@ -62,8 +79,8 @@ struct Project: Codable, Identifiable, Equatable {
             let scheme = (proj as NSString).deletingPathExtension
             let prefix = dir.isEmpty ? "" : dir + "/"
             let workspace = pods ? scheme + ".xcworkspace" : find(in: dir, ext: "xcworkspace")
-            let container = workspace.map { "-workspace '\(prefix)\($0)'" } ?? "-project '\(prefix)\(proj)'"
-            let base = "xcodebuild \(container) -scheme '\(scheme)' -derivedDataPath build/shipyard"
+            let container = workspace.map { "-workspace \(shq(prefix + $0))" } ?? "-project \(shq(prefix + proj))"
+            let base = "xcodebuild \(container) -scheme \(shq(scheme)) -derivedDataPath build/shipyard"
             return ("\(base) -configuration Release -sdk iphoneos -allowProvisioningUpdates ${SHIPYARD_TEAM:+DEVELOPMENT_TEAM=$SHIPYARD_TEAM} build",
                     "\(base) -configuration Release -sdk iphonesimulator build",
                     "build/shipyard/Build/Products")
@@ -80,6 +97,8 @@ struct Project: Codable, Identifiable, Equatable {
             let install = exists("yarn.lock") ? "yarn install" : exists("pnpm-lock.yaml") ? "pnpm install"
                 : exists("bun.lockb") || exists("bun.lock") ? "bun install" : "npm install"
             prepare = exists("ios/Podfile") ? "\(install) && (cd ios && pod install)" : install
+            // Gradle finds the Android SDK through this git-ignored file, which a clean copy doesn't have
+            if copy.isEmpty, exists("android/local.properties") { copy = "android/local.properties" }
             commands = [:]; artifacts = [:]
             if exists("android") {
                 commands?["android"] = "cd android && ./gradlew assembleRelease"
@@ -98,6 +117,7 @@ struct Project: Codable, Identifiable, Equatable {
             }
         case .android:
             prepare = ""
+            if copy.isEmpty, exists("local.properties") { copy = "local.properties" }   // see React Native above
             // debug, because a release APK only installs once the project has a signing config
             commands = ["android": "./gradlew assembleDebug"]
             artifacts = ["android": "app/build/outputs/apk/debug/*.apk"]
@@ -172,12 +192,12 @@ final class Engine {
     var project: Project? { projects.first { $0.path == currentPath } }
 
     var hasFailure: Bool {
-        failed.contains { $0.value == latestSHA } || devices.contains { $0.error != nil }
+        failed.contains { $0.value == latestSHA } || devices.contains { $0.error != nil && $0.error?.hasPrefix("Locked") != true }
     }
 
     /// The project a pass is working on. Snapshotted so edits mid-pass can't mix two projects.
     private var active = Project(path: "")
-    private var home: String { NSHomeDirectory() + "/.shipyard/" + active.name }   // ponytail: keyed by folder name; two projects with the same folder name would share it
+    private var home: String { NSHomeDirectory() + "/.shipyard/" + (active.dir ?? active.name) }
     private var worktree: String { home + "/src" }
     private var stateFile: String { home + "/state.json" }
     private var loadedRepo = ""
@@ -195,8 +215,12 @@ final class Engine {
     init() {
         if demo { loadDemo(); return }
         let d = UserDefaults.standard
-        if let data = d.data(forKey: "projects"), let saved = try? JSONDecoder().decode([Project].self, from: data) {
-            projects = saved
+        if let data = d.data(forKey: "projects") {
+            if let saved = try? JSONDecoder().decode([Project].self, from: data) {
+                projects = saved
+            } else {
+                d.set(data, forKey: "projects.unreadable")   // keep it: the save below would otherwise erase it
+            }
         } else if let repo = d.string(forKey: "repo"), !repo.isEmpty {   // settings from the single-project version
             projects = [Project(path: repo, branch: d.string(forKey: "branch") ?? "main",
                                 copy: d.string(forKey: "copy") ?? "",
@@ -232,6 +256,11 @@ final class Engine {
         if !projects.contains(where: { $0.path == path }) {
             var project = Project(path: path)
             project.applyPreset(Project.detect(path))
+            // Two projects can share a folder name (…/a/app, …/b/app); each still needs its own build folder.
+            let used = Set(projects.map { $0.dir ?? $0.name })
+            var dir = project.name, n = 2
+            while used.contains(dir) { dir = "\(project.name)-\(n)"; n += 1 }
+            project.dir = dir
             projects.append(project)
         }
         select(path)
@@ -243,10 +272,23 @@ final class Engine {
         projects[i].applyPreset(kind)
     }
 
+    /// Removes the project from Shipyard along with its build copy and kept builds. The project folder itself is untouched.
     func removeCurrentProject() {
-        guard !busy else { return }
-        projects.removeAll { $0.path == currentPath }
-        select(projects.first?.path ?? "")
+        guard !busy, let project else { return }
+        busy = true
+        Task {
+            active = project
+            let dir = project.dir ?? project.name
+            if !dir.isEmpty, !dir.contains("/"), dir != ".", dir != ".." {   // only ever delete inside ~/.shipyard
+                let repo = q(project.path)
+                _ = await sh("git -C \(repo) worktree remove --force \(q(worktree)); git -C \(repo) worktree prune", quiet: true, timeout: 120)
+                try? FileManager.default.removeItem(atPath: home)
+            }
+            projects.removeAll { $0.path == project.path }
+            loadedRepo = ""   // so nothing is saved back into the folder just deleted
+            busy = false
+            select(projects.first?.path ?? "")
+        }
     }
 
     func select(_ path: String) {
@@ -312,8 +354,8 @@ final class Engine {
     /// History's "Upload to Firebase": sends (or re-sends) a kept build.
     func uploadBuild(_ sha: String) {
         guard !demo, !busy, let project, let record = history.first(where: { $0.sha == sha }) else { return }
+        busy = true   // before the task starts, so a second click can't slip in
         Task {
-            busy = true
             active = project
             for p in Platform.allCases where record.succeeded(p) { await upload(p, sha) }
             status = "Idle"
@@ -328,7 +370,7 @@ final class Engine {
     /// One pass: find devices, look for a new commit, build if needed, install where pending.
     func tick(force: Bool = false) async {
         guard !busy, !demo else { return }
-        guard let project else { status = "Choose a Flutter project"; return }
+        guard let project else { status = "Choose a project"; return }
         busy = true
         active = project
         defer { busy = false; save(); notifyEvents() }
@@ -361,9 +403,9 @@ final class Engine {
 
     /// Asks Xcode and adb directly, so no particular framework has to be installed.
     private func refreshDevices() async {
-        let x = await sh("xcrun xcdevice list --timeout 5 2>/dev/null", quiet: true)
-        let sim = await sh("xcrun simctl list devices booted -j 2>/dev/null", quiet: true)
-        let a = await sh("adb devices -l 2>/dev/null", quiet: true)
+        let x = await sh("xcrun xcdevice list --timeout 5 2>/dev/null", quiet: true, timeout: 60)
+        let sim = await sh("xcrun simctl list devices booted -j 2>/dev/null", quiet: true, timeout: 60)
+        let a = await sh("adb devices -l 2>/dev/null", quiet: true, timeout: 60)
         guard x.ok || sim.ok || a.ok else { return }
         let seen = Self.parseXcdevice(x.out) + Self.parseSimctl(sim.out) + Self.parseAdb(a.out)
         for i in devices.indices { devices[i].online = false }
@@ -421,11 +463,12 @@ final class Engine {
 
     private func fetchLatest() async -> Bool {
         let repo = q(active.path)
-        let fetch = await sh("git -C \(repo) fetch -q --prune origin", quiet: true)
+        // No --prune: this is the user's own checkout, and deleting its remote branches is not ours to do.
+        let fetch = await sh("git -C \(repo) fetch -q origin", quiet: true, timeout: 300)
         guard fetch.ok else { append("[git fetch failed]\n\(fetch.out)\n"); return false }
-        let refs = await sh("git -C \(repo) for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin", quiet: true)
+        let refs = await sh("git -C \(repo) for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin", quiet: true, timeout: 60)
         branches = refs.out.split(separator: "\n").map(String.init).filter { $0 != "HEAD" }
-        let r = await sh("git -C \(repo) log -1 --format='%H %s' \(q("origin/" + active.branch))", quiet: true)
+        let r = await sh("git -C \(repo) log -1 --format='%H %s' \(q("origin/" + active.branch))", quiet: true, timeout: 60)
         let parts = r.out.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ", maxSplits: 1)
         guard r.ok, let sha = parts.first else { append("[no branch origin/\(active.branch)]\n\(r.out)\n"); return false }
         latestSHA = String(sha)
@@ -440,7 +483,9 @@ final class Engine {
         status = "Preparing \(sha.prefix(7))…"
         try? FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: worktree) {
-            guard await sh("git -C \(q(active.path)) worktree add -q --detach \(q(worktree)) \(sha)").ok else { return false }
+            // prune first: if the build copy was deleted by hand, git still has it registered and refuses to re-add it
+            let repo = q(active.path)
+            guard await sh("git -C \(repo) worktree prune && git -C \(repo) worktree add -q --detach \(q(worktree)) \(sha)", timeout: 600).ok else { return false }
         }
         var cmd = "git checkout -q --detach \(sha)"
         for p in active.copy.split(separator: " ").map(String.init) {
@@ -499,7 +544,7 @@ final class Engine {
         case .iosSim: "xcrun simctl install \(q(id)) \(artifact)"
         case .android: "adb -s \(q(id)) install -r \(artifact)"
         }
-        let r = await sh(cmd, cwd: worktree, quiet: true)
+        let r = await sh(cmd, cwd: worktree, quiet: true, timeout: 900)
         guard let j = devices.firstIndex(where: { $0.id == id }) else { return }
         devices[j].installing = false
         let error: String? = r.ok ? nil
@@ -521,8 +566,8 @@ final class Engine {
     /// Install button: builds this device's platform first if the latest commit isn't built yet.
     func installNow(_ id: String) {
         guard !demo, !busy, let project, let d = devices.first(where: { $0.id == id }) else { return }
+        busy = true
         Task {
-            busy = true
             active = project
             if let sha = latestSHA, built[d.platform] != sha, await prepare(sha) { await build(d.platform, sha) }
             await install(id)
@@ -537,8 +582,8 @@ final class Engine {
     /// newest build turns Auto off for that device, otherwise the next pass would undo it.
     func installBuild(_ sha: String, on ids: [String]) {
         guard !demo, !busy, let project else { return }
+        busy = true
         Task {
-            busy = true
             active = project
             for id in ids {
                 guard let i = devices.firstIndex(where: { $0.id == id }) else { continue }
@@ -640,46 +685,115 @@ final class Engine {
 
     private func append(_ text: String) {
         log += text
-        if log.count > 200_000 { log = String(log.suffix(150_000)) }
+        if log.utf8.count > 200_000 { log = String(log.suffix(150_000)) }
     }
 
-    private func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    private func q(_ s: String) -> String { shq(s) }
 
-    /// Runs a command in a login shell, so Homebrew's tools are on PATH like in Terminal.
-    private func sh(_ command: String, cwd: String? = nil, quiet: Bool = false) async -> (ok: Bool, out: String) {
-        if !quiet { append("$ \(command)\n") }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", command]
-        if let cwd { p.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+    private var shellEnv: [String: String]?
+
+    /// What a Terminal window would have. An app started from Finder doesn't get anything ~/.zshrc sets up
+    /// (ANDROID_HOME, nvm, rbenv, Java…), so ask an interactive login shell once and reuse its answer.
+    private func environment() async -> [String: String] {
+        if let shellEnv { return shellEnv }
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+        let marker = "__SHIPYARD_ENV__"
+        let r = await runShell("/bin/zsh -ilc 'printf \(marker); /usr/bin/env -0' 2>/dev/null", env: env, cwd: nil, timeout: 20)
+        if let start = r.out.range(of: marker) {
+            for pair in r.out[start.upperBound...].split(separator: "\0") {
+                let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                if kv.count == 2, !kv[0].isEmpty { env[String(kv[0])] = String(kv[1]) }
+            }
+        }
+        shellEnv = env
+        return env
+    }
+
+    /// Runs one command for the active project. Builds get an hour by default; quick queries pass less.
+    private func sh(_ command: String, cwd: String? = nil, quiet: Bool = false, timeout: TimeInterval = 3600) async -> (ok: Bool, out: String) {
+        if !quiet { append("$ \(command)\n") }
+        var env = await environment()
         // Supplies a signing team when the Xcode project has none set
         if !active.team.isEmpty {
             env["FLUTTER_XCODE_DEVELOPMENT_TEAM"] = active.team   // read by flutter
             env["SHIPYARD_TEAM"] = active.team                    // used by the xcodebuild presets
         }
+        var forward: (@Sendable (String) -> Void)?
+        if !quiet {
+            forward = { [weak self] text in
+                Task { @MainActor [weak self] in self?.append(text) }
+            }
+        }
+        let r = await runShell(command, env: env, cwd: cwd, timeout: timeout, onText: forward)
+        if r.timedOut { append("[stopped: no result after \(Int(timeout)) seconds]\n") }
+        return (r.ok, r.out)
+    }
+}
+
+/// Quotes a string for the shell.
+func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+/// Runs a shell command off the main thread and returns when it ends.
+/// - Output is decoded leniently, so a stray non-UTF-8 byte can't stall the reader.
+/// - After `timeout` seconds the command and everything it started are killed, so nothing can hang the app forever.
+func runShell(_ command: String, env: [String: String], cwd: String?, timeout: TimeInterval,
+              onText: (@Sendable (String) -> Void)? = nil) async -> (ok: Bool, out: String, timedOut: Bool) {
+    await Task.detached {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-c", command]
+        if let cwd { p.currentDirectoryURL = URL(fileURLWithPath: cwd) }
         p.environment = env
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
         p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return (false, error.localizedDescription, false) }
 
-        do { try p.run() } catch { return (false, "\(error.localizedDescription)") }
-        var out = ""
-        do {
-            for try await line in pipe.fileHandleForReading.bytes.lines {
-                out += line + "\n"
-                if !quiet { append(line + "\n") }
+        let pid = p.processIdentifier
+        let killer = Task.detached {
+            try await Task.sleep(for: .seconds(timeout))   // throws if the command finishes first
+            // Children before parents, so nothing is left holding the output pipe open.
+            let k = Process()
+            k.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            k.arguments = ["-c", "t() { for c in $(pgrep -P $1); do t $c; done; kill $1 2>/dev/null }; t \(pid)"]
+            try? k.run()
+            k.waitUntilExit()
+        }
+
+        var all = Data(), pending = Data()
+        while case let chunk = pipe.fileHandleForReading.availableData, !chunk.isEmpty {
+            all.append(chunk)
+            guard let onText else { continue }
+            pending.append(chunk)
+            if let newline = pending.lastIndex(of: 0x0A) {   // hand over whole lines only, so characters aren't cut in half
+                onText(String(decoding: pending[...newline], as: UTF8.self))
+                pending = Data(pending[pending.index(after: newline)...])
             }
-        } catch {}
-        p.waitUntilExit()   // output hit EOF, so the process is already exiting
-        return (p.terminationStatus == 0, out)
-    }
+        }
+        if let onText, !pending.isEmpty { onText(String(decoding: pending, as: UTF8.self)) }
+        p.waitUntilExit()
+        killer.cancel()
+        let timedOut = (try? await killer.value) != nil
+        return (p.terminationStatus == 0 && !timedOut, String(decoding: all, as: UTF8.self), timedOut)
+    }.value
 }
 
 /// `Shipyard --selftest`: the smallest check that fails if device parsing or the queue rule breaks.
-func selftest() {
+func selftest() async {
+    // The runner survives bad bytes and gives up on a command that never ends.
+    let started = Date()
+    let run = await runShell("printf 'a\\377b\\n'; sleep 30", env: ["PATH": "/usr/bin:/bin"], cwd: nil, timeout: 1)
+    precondition(run.timedOut && !run.ok && run.out.hasPrefix("a") && Date().timeIntervalSince(started) < 10)
+    let fine = await runShell("echo hi; exit 3", env: ["PATH": "/usr/bin:/bin"], cwd: nil, timeout: 10)
+    precondition(!fine.ok && !fine.timedOut && fine.out == "hi\n")
+    precondition(shq("it's") == "'it'\\''s'")
+
+    // Saved projects from 0.2.0 (kind stored as its label) and unknown kinds still load.
+    let saved = try! JSONDecoder().decode([Project].self, from: Data(#"[{"path":"/a/app","branch":"main","copy":"","flutterArgs":"","team":"","kind":"iOS (Xcode)"},{"path":"/b/app","branch":"main","copy":"","flutterArgs":"","team":"","kind":"someday"}]"#.utf8))
+    precondition(saved.map(\.kind) == [.ios, .custom])
+
     let xc = """
     noise before json
     [{"identifier":"A1","name":" Phone ","platform":"com.apple.platform.iphoneos","available":true,"interface":"usb","simulator":false},

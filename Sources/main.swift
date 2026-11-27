@@ -1,5 +1,5 @@
 if CommandLine.arguments.contains("--selftest") {
-    selftest()
+    await selftest()
 } else {
     ShipyardApp.main()
 }
