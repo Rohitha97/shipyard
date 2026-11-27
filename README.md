@@ -11,6 +11,7 @@ Merge a pull request, pick up your phone, and the new build is already there. Wo
 ## What it does
 
 - **Watches a branch.** Checks `origin/<branch>` every 60 seconds (configurable). A new commit starts a build.
+- **You stay in control.** Start, Stop and Build buttons; switching branch waits for you instead of building.
 - **Builds once, installs everywhere.** One build per platform per commit, pushed to every connected device.
 - **Physical devices and simulators.** iPhones and iPads, Android phones, iOS simulators and Android emulators. Each row shows whether the device is on USB, Wi-Fi or is a simulator.
 - **A queue for devices that aren't ready.** A locked or offline device gets the build as soon as it is unlocked or reconnects.
@@ -55,6 +56,18 @@ Each device needs a one-time setup before it can receive builds:
 | iPhone / iPad | Connect by USB once and trust the Mac, turn on Developer Mode, and register the device with your Apple developer team. For Wi-Fi, tick "Connect via network" in Xcode's Devices window. |
 | Android | Turn on USB debugging, or Wireless debugging (Android 11+) and pair once with `adb pair`. |
 | Simulator / emulator | Just start it. Simulators have Auto off by default so a merge doesn't replace an app you are debugging. |
+
+## Controls
+
+Three buttons sit next to the latest commit:
+
+| Button | What it does |
+|---|---|
+| **Start** | Builds and installs new commits automatically, on devices with Auto on. |
+| **Stop** | Stops whatever is running and stops automatic builds until you press Start. Shipyard keeps checking for commits and devices. |
+| **Build** | Builds the latest commit now, without installing it. |
+
+Changing the branch never starts a build. Shipyard shows the new branch's latest commit and waits, with Start highlighted, until you press Start or Build. To install on one device, use its Install button.
 
 ## Project types
 
