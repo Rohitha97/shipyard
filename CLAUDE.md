@@ -9,7 +9,7 @@ A macOS menu-bar app that watches a Git branch of a mobile app project (Flutter,
 3. **Check for bugs too.** Ponytail review only covers unnecessary code. Before calling work finished, also re-read the change for correctness and for the invariants below.
 4. **Build and self-check before saying it works.** `./build-app.sh` must print `selftest ok` and `Built Shipyard.app`. A build that fails still leaves the old `Shipyard.app` in place, so read the output; don't assume.
 5. **Say what was not tested.** Report plainly which paths were exercised for real and which only compiled.
-6. **Commit, push and release only when asked.** Never on your own initiative.
+6. **Commit and push only when asked.** Never on your own initiative. Releases are automatic on merge to `main`, so merging is publishing: never merge or push to `main` without being asked.
 
 ## Layout
 
@@ -18,7 +18,8 @@ A macOS menu-bar app that watches a Git branch of a mobile app project (Flutter,
 | `Sources/Engine.swift` | Everything that isn't a view: data types, the engine, the command runner, `selftest()` |
 | `Sources/App.swift` | All SwiftUI views |
 | `Sources/main.swift` | Entry point: `--selftest` or the app |
-| `build-app.sh` | Universal build, self-check, bundle, ad-hoc signing. Holds the version number |
+| `build-app.sh` | Universal build, self-check, bundle, ad-hoc signing. Version comes from `VERSION` or the latest tag |
+| `.github/workflows/release.yml` | Publishes the next patch release on every merge to `main` that changes the app |
 | `Resources/AppIcon.icns` | Built from `design/app-icon.svg` |
 | `docs/` | README images |
 | `shipyard.sh` | Original Flutter-only script, kept as a command-line fallback |
@@ -101,15 +102,17 @@ Never put the user's real details into code, the README, release notes or screen
 - UI text is plain and specific: say what happened and what to do next ("Locked — unlock it and it will install").
 - Keep the status badge names consistent: Latest, Update available, Not installed, Installing, Locked, Failed, No build.
 
-## Releasing (only when asked)
+## Releasing
 
-1. Bump `CFBundleShortVersionString` in `build-app.sh`.
-2. `./build-app.sh`, then commit and push to `main`.
-3. `ditto -c -k --keepParent Shipyard.app Shipyard.zip` and `gh release create vX.Y.Z Shipyard.zip` with notes written for users, not developers.
-4. Download the published zip back and check it: signature verifies, `--selftest` passes, version is right.
-5. Update the copy in `/Applications` and relaunch it.
+Releases are made by `.github/workflows/release.yml`, not by hand.
 
-Release notes always include the install steps and the note that the app is not notarized. Don't commit `Shipyard.app`, `Shipyard.zip`, `.build/` or `design/logo/`.
+- **Trigger:** a push to `main` that changes `Sources/`, `Resources/`, `Package.swift`, `build-app.sh` or the workflow. Documentation-only merges do not release.
+- **Version:** the latest `v*` tag with its last number raised by one. Never write a version number into a file.
+- **A bigger jump** (0.3.0, 1.0.0): push that tag by hand first; numbering continues from it.
+- **What it does:** runs `./build-app.sh` (so a failing self-check blocks the release), zips the app, and creates the GitHub release with generated notes plus the install steps.
+- **After a release, when asked:** update the copy in `/Applications` from a local `./build-app.sh` and relaunch it.
+
+Because pull request titles become the release notes, write them for users: what changed, in plain words. Don't commit `Shipyard.app`, `Shipyard.zip`, `.build/` or `design/logo/`.
 
 ## Known gaps (don't "fix" silently; raise them)
 
