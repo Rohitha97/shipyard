@@ -57,6 +57,7 @@ struct Project: Codable, Identifiable, Equatable {
     var commands: [String: String]?     // Platform.rawValue -> build command; empty = platform not built
     var artifacts: [String: String]?    // Platform.rawValue -> built .app/.apk, relative to the project; * allowed
     var dir: String?                    // folder under ~/.shipyard; nil in older projects, which use the folder name
+    var paused: Bool?                   // true = watch and report, but build or install only when asked
 
     var id: String { path }
     var name: String { (path as NSString).lastPathComponent }
@@ -186,7 +187,20 @@ final class Engine {
     var latestSubject = ""
     var lastChecked: Date?
     var status = "Starting…"
-    var busy = false
+    var busy = false {
+        didSet {
+            guard !busy else { return }
+            stopRequested = false
+            // A branch picked (or Start pressed) while a pass was running is applied as soon as that pass ends.
+            if recheck { recheck = false; Task { self.switchTo(self.project) } }
+        }
+    }
+    private var recheck = false
+    private var stopRequested = false      // Stop was pressed during this pass: finish nothing more
+    private var running: Canceller?        // the command in flight, so Stop can kill it
+
+    /// Automatic builds are stopped for the current project.
+    var paused: Bool { project?.paused == true }
     var log = ""
 
     var project: Project? { projects.first { $0.path == currentPath } }
@@ -297,11 +311,39 @@ final class Engine {
         switchTo(project)
     }
 
+    /// Always takes effect: the running pass keeps its own snapshot of the project, so this can't disturb it.
     func setBranch(_ branch: String) {
-        guard !busy, let i = projects.firstIndex(where: { $0.path == currentPath }) else { return }
+        guard let i = projects.firstIndex(where: { $0.path == currentPath }) else { return }
         projects[i].branch = branch
-        switchTo(project)
+        projects[i].paused = true   // a new branch is only looked at; building it is the user's call (Start or Build)
+        if busy { recheck = true } else { switchTo(project) }
     }
+
+    // MARK: Start / Stop / Build
+
+    /// Start: build and install new commits automatically again.
+    func start() {
+        guard !demo, let i = projects.firstIndex(where: { $0.path == currentPath }) else { return }
+        projects[i].paused = false
+        if busy { recheck = true } else { Task { await tick() } }
+    }
+
+    /// Stop: kill whatever is running and stop automatic builds until Start is pressed.
+    func stop() {
+        guard !demo, let i = projects.firstIndex(where: { $0.path == currentPath }) else { return }
+        projects[i].paused = true
+        if busy {
+            stopRequested = true
+            running?.cancel()
+            status = "Stopping…"
+            append("[stopped]\n")
+        } else {
+            status = "Stopped"
+        }
+    }
+
+    /// Build: build the latest commit now, without installing it.
+    func buildNow() { Task { await tick(.build) } }
 
     func update(_ project: Project) {
         guard let i = projects.firstIndex(where: { $0.path == project.path }) else { return }
@@ -309,6 +351,7 @@ final class Engine {
     }
 
     private func switchTo(_ project: Project?) {
+        guard !demo else { return }   // sample data has nothing to reload
         latestSHA = nil; latestSubject = ""
         guard let project else { devices = []; branches = []; loadedRepo = ""; return }
         if loadedRepo != project.path { active = project; branches = []; load() }
@@ -367,8 +410,12 @@ final class Engine {
 
     // MARK: the loop
 
-    /// One pass: find devices, look for a new commit, build if needed, install where pending.
-    func tick(force: Bool = false) async {
+    enum Run { case auto, build }
+
+    /// One pass: find devices and the latest commit, then build and install as far as `mode` allows.
+    /// - auto: what the timer does. Builds and installs for devices with Auto on, unless the project is stopped.
+    /// - build: build for every connected device's platform, install nothing.
+    func tick(_ mode: Run = .auto) async {
         guard !busy, !demo else { return }
         guard let project else { status = "Choose a project"; return }
         busy = true
@@ -380,25 +427,42 @@ final class Engine {
         await refreshDevices()
         status = "Checking \(active.branch)…"
         guard await fetchLatest(), let sha = latestSHA else {
-            status = "Couldn't read origin/\(active.branch) — see log"
+            status = stopRequested ? "Stopped" : "Couldn't read origin/\(active.branch) — see log"
             return
         }
 
-        // Build only for platforms a connected device is waiting on; offline ones build when they return.
-        let wanted = Platform.allCases.filter { p in
-            !active.command(p).isEmpty
-                && (devices.contains { $0.platform == p && $0.online && ($0.auto || force) } || firebaseApp(p) != nil)
-                && built[p] != sha && (force || failed[p] != sha)
-        }
+        let paused = active.paused == true, stopped = paused && mode == .auto
+        let wanted = Self.platformsToBuild(mode, paused: paused, sha: sha, devices: devices, built: built, failed: failed,
+                                           buildable: Platform.allCases.filter { !active.command($0).isEmpty },
+                                           uploads: Platform.allCases.filter { firebaseApp($0) != nil })
         if !wanted.isEmpty, await prepare(sha) {
-            for p in wanted { await build(p, sha) }
+            for p in wanted where !stopRequested { await build(p, sha) }
         }
-        for d in devices where d.needsInstall(built: built[d.platform]) { await install(d.id) }
+        if mode == .auto, !stopped {
+            for d in devices where !stopRequested && d.needsInstall(built: built[d.platform]) { await install(d.id) }
+        }
 
-        let pending = devices.filter { $0.auto && $0.installedSHA != sha && !active.command($0.platform).isEmpty }.count
-        status = failed.contains { $0.value == sha } ? "Build failed — see log"
-            : pending > 0 ? "\(pending) device\(pending == 1 ? "" : "s") waiting"
+        let behind = devices.filter { $0.installedSHA != sha && !active.command($0.platform).isEmpty }
+        let waiting = behind.filter(\.auto).count
+        status = stopRequested ? "Stopped"
+            : failed.contains { $0.value == sha } ? "Build failed — see log"
+            : stopped ? (behind.isEmpty ? "Stopped · up to date" : "Stopped · \(sha.prefix(7)) is not on \(behind.count) device\(behind.count == 1 ? "" : "s")")
+            : waiting > 0 ? "\(waiting) device\(waiting == 1 ? "" : "s") waiting"
             : "Up to date"
+    }
+
+    /// Which platforms a pass should build. No side effects, so the self-check covers it.
+    /// A platform is built when the project can build it, something wants it (a connected device, or an upload),
+    /// and this commit isn't built yet. The timer skips stopped projects, devices with Auto off, and commits that already failed.
+    nonisolated static func platformsToBuild(_ mode: Run, paused: Bool, sha: String, devices: [Device],
+                                             built: [Platform: String], failed: [Platform: String],
+                                             buildable: [Platform], uploads: [Platform]) -> [Platform] {
+        let manual = mode != .auto
+        guard manual || !paused else { return [] }
+        return buildable.filter { p in
+            (devices.contains { $0.platform == p && $0.online && ($0.auto || manual) } || uploads.contains(p))
+                && built[p] != sha && (manual || failed[p] != sha)
+        }
     }
 
     /// Asks Xcode and adb directly, so no particular framework has to be installed.
@@ -494,7 +558,7 @@ final class Engine {
         }
         if let prep = active.prepare, !prep.isEmpty { cmd += " && ( \(prep) )" }
         let ok = await sh(cmd, cwd: worktree).ok
-        if !ok { for p in Platform.allCases { failed[p] = sha } }
+        if !ok, !stopRequested { for p in Platform.allCases { failed[p] = sha } }   // being stopped is not a failure
         return ok
     }
 
@@ -503,6 +567,7 @@ final class Engine {
         guard !command.isEmpty else { return }
         status = "Building \(p.label) \(sha.prefix(7))…"
         var ok = await sh(command, cwd: worktree).ok
+        if stopRequested { append("[\(p.label) build stopped]\n"); return }   // not a failure: leave it to be built later
         if ok {
             // Keep a copy per commit for rollback. cp -c clones on APFS, so it costs no time and little disk.
             // ponytail: a * in the artifact path must match exactly one file; several matches break the install.
@@ -547,6 +612,7 @@ final class Engine {
         let r = await sh(cmd, cwd: worktree, quiet: true, timeout: 900)
         guard let j = devices.firstIndex(where: { $0.id == id }) else { return }
         devices[j].installing = false
+        if stopRequested { return }
         let error: String? = r.ok ? nil
             : r.out.localizedCaseInsensitiveContains("locked") ? "Locked — unlock it and it will install"
             : r.out.split(separator: "\n").last.map(String.init) ?? "Install failed"
@@ -560,8 +626,6 @@ final class Engine {
     }
 
     // MARK: buttons
-
-    func buildNow() { Task { await tick(force: true) } }
 
     /// Install button: builds this device's platform first if the latest commit isn't built yet.
     func installNow(_ id: String) {
@@ -678,7 +742,7 @@ final class Engine {
                       failed: Dictionary(uniqueKeysWithValues: failed.map { ($0.key.rawValue, $0.value) }),
                       history: history)
         try? FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
-        try? JSONEncoder().encode(s).write(to: URL(fileURLWithPath: stateFile))
+        try? JSONEncoder().encode(s).write(to: URL(fileURLWithPath: stateFile), options: .atomic)
     }
 
     // MARK: shell
@@ -712,6 +776,7 @@ final class Engine {
 
     /// Runs one command for the active project. Builds get an hour by default; quick queries pass less.
     private func sh(_ command: String, cwd: String? = nil, quiet: Bool = false, timeout: TimeInterval = 3600) async -> (ok: Bool, out: String) {
+        if stopRequested { return (false, "") }
         if !quiet { append("$ \(command)\n") }
         var env = await environment()
         // Supplies a signing team when the Xcode project has none set
@@ -725,7 +790,10 @@ final class Engine {
                 Task { @MainActor [weak self] in self?.append(text) }
             }
         }
-        let r = await runShell(command, env: env, cwd: cwd, timeout: timeout, onText: forward)
+        let canceller = Canceller()
+        running = canceller
+        let r = await runShell(command, env: env, cwd: cwd, timeout: timeout, onText: forward, canceller: canceller)
+        running = nil
         if r.timedOut { append("[stopped: no result after \(Int(timeout)) seconds]\n") }
         return (r.ok, r.out)
     }
@@ -734,11 +802,37 @@ final class Engine {
 /// Quotes a string for the shell.
 func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
+/// Kills a process and everything it started, children first so nothing is left holding its output pipe open.
+func killTree(_ pid: Int32) {
+    let k = Process()
+    k.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    k.arguments = ["-c", "t() { for c in $(pgrep -P $1); do t $c; done; kill $1 2>/dev/null }; t \(pid)"]
+    try? k.run()
+    k.waitUntilExit()
+}
+
+/// Lets another thread stop a running command, whether it has started yet or not.
+final class Canceller: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pid: Int32 = 0
+    private var cancelled = false
+
+    func started(_ p: Int32) {
+        lock.lock(); pid = p; let late = cancelled; lock.unlock()
+        if late { killTree(p) }
+    }
+
+    func cancel() {
+        lock.lock(); cancelled = true; let p = pid; lock.unlock()
+        if p != 0 { killTree(p) }
+    }
+}
+
 /// Runs a shell command off the main thread and returns when it ends.
 /// - Output is decoded leniently, so a stray non-UTF-8 byte can't stall the reader.
 /// - After `timeout` seconds the command and everything it started are killed, so nothing can hang the app forever.
 func runShell(_ command: String, env: [String: String], cwd: String?, timeout: TimeInterval,
-              onText: (@Sendable (String) -> Void)? = nil) async -> (ok: Bool, out: String, timedOut: Bool) {
+              onText: (@Sendable (String) -> Void)? = nil, canceller: Canceller? = nil) async -> (ok: Bool, out: String, timedOut: Bool) {
     await Task.detached {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -752,14 +846,10 @@ func runShell(_ command: String, env: [String: String], cwd: String?, timeout: T
         do { try p.run() } catch { return (false, error.localizedDescription, false) }
 
         let pid = p.processIdentifier
+        canceller?.started(pid)
         let killer = Task.detached {
             try await Task.sleep(for: .seconds(timeout))   // throws if the command finishes first
-            // Children before parents, so nothing is left holding the output pipe open.
-            let k = Process()
-            k.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            k.arguments = ["-c", "t() { for c in $(pgrep -P $1); do t $c; done; kill $1 2>/dev/null }; t \(pid)"]
-            try? k.run()
-            k.waitUntilExit()
+            killTree(pid)
         }
 
         var all = Data(), pending = Data()
@@ -788,6 +878,13 @@ func selftest() async {
     precondition(run.timedOut && !run.ok && run.out.hasPrefix("a") && Date().timeIntervalSince(started) < 10)
     let fine = await runShell("echo hi; exit 3", env: ["PATH": "/usr/bin:/bin"], cwd: nil, timeout: 10)
     precondition(!fine.ok && !fine.timedOut && fine.out == "hi\n")
+    // Stop: a running command and its children die promptly.
+    let canceller = Canceller()
+    let stopStart = Date()
+    Task.detached { try? await Task.sleep(for: .milliseconds(400)); canceller.cancel() }
+    let halted = await runShell("sleep 30 & sleep 30; wait", env: ["PATH": "/usr/bin:/bin"], cwd: nil, timeout: 60, canceller: canceller)
+    precondition(!halted.ok && !halted.timedOut && Date().timeIntervalSince(stopStart) < 10)
+
     precondition(shq("it's") == "'it'\\''s'")
 
     // Saved projects from 0.2.0 (kind stored as its label) and unknown kinds still load.
@@ -826,6 +923,25 @@ func selftest() async {
     x.installedSHA = "abc"; precondition(!x.needsInstall(built: "abc") && x.needsInstall(built: "def"))
     x.auto = false; precondition(!x.needsInstall(built: "def"))
     x.auto = true; x.online = false; precondition(!x.needsInstall(built: "def"))
+    // What a pass builds: phone online with Auto on, simulator online with Auto off, tablet offline.
+    let fleet = [Device(id: "p", name: "p", platform: .ios, online: true),
+                 Device(id: "s", name: "s", platform: .iosSim, auto: false, online: true),
+                 Device(id: "t", name: "t", platform: .android)]
+    func plan(_ mode: Engine.Run, paused: Bool = false, built: [Platform: String] = [:], failed: [Platform: String] = [:],
+              buildable: [Platform] = Platform.allCases, uploads: [Platform] = []) -> [Platform] {
+        Engine.platformsToBuild(mode, paused: paused, sha: "new", devices: fleet, built: built, failed: failed, buildable: buildable, uploads: uploads)
+    }
+    precondition(plan(.auto) == [.ios])                                  // only the connected Auto device
+    precondition(plan(.build) == [.ios, .iosSim])                        // Build also covers Auto-off devices
+    precondition(plan(.auto, paused: true).isEmpty)                      // stopped: the timer builds nothing
+    precondition(plan(.build, paused: true) == [.ios, .iosSim])          // ...but Build still works
+    precondition(plan(.auto, built: [.ios: "new"]).isEmpty)              // already built
+    precondition(plan(.auto, built: [.ios: "old"]) == [.ios])
+    precondition(plan(.auto, failed: [.ios: "new"]).isEmpty)             // don't loop on a broken commit
+    precondition(plan(.build, failed: [.ios: "new"]) == [.ios, .iosSim]) // Build retries it
+    precondition(plan(.auto, buildable: [.android]).isEmpty)             // no command for iOS; Android device is offline
+    precondition(plan(.auto, uploads: [.android]) == [.ios, .android])   // an upload wants it even with no device
+
     precondition(Engine.parseXcdevice("garbage").isEmpty && Engine.parseSimctl("").isEmpty && Engine.parseAdb("").isEmpty)
 
     // Project type detection and presets, against throwaway folders

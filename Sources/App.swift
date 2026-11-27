@@ -11,6 +11,7 @@ struct ShipyardApp: App {
                 .navigationTitle("Shipyard")
         }
         .defaultSize(width: 860, height: 560)
+        .windowToolbarStyle(.unified(showsTitle: false))   // the window is still named Shipyard; the toolbar just doesn't spend space on it
         MenuBarExtra {
             MenuContent().environment(engine)
         } label: {
@@ -27,7 +28,12 @@ struct MenuContent: View {
 
     var body: some View {
         Text(engine.status)
-        Button("Build Now") { engine.buildNow() }.disabled(engine.busy)
+        if engine.paused && !engine.busy {
+            Button("Start Automatic Builds") { engine.start() }
+        } else {
+            Button(engine.busy ? "Stop" : "Stop Automatic Builds") { engine.stop() }
+        }
+        Button("Build") { engine.buildNow() }.disabled(engine.busy)
         Divider()
         Button("Open Shipyard") {
             openWindow(id: "main")
@@ -57,7 +63,7 @@ struct ContentView: View {
                 }
             } else {
                 SummaryHeader(sha: engine.latestSHA, subject: engine.latestSubject, status: engine.status,
-                              busy: engine.busy, failed: engine.failed.contains { $0.value == engine.latestSHA }, checked: engine.lastChecked,
+                              busy: engine.busy, paused: engine.paused, failed: engine.failed.contains { $0.value == engine.latestSHA }, checked: engine.lastChecked,
                               devices: engine.devices)
                 Divider()
                 if showHistory {
@@ -70,7 +76,7 @@ struct ContentView: View {
             LogBar(showLog: $showLog, log: engine.log)
         }
         .toolbar {
-            ToolbarItemGroup(placement: .navigation) { ProjectPickers(choosing: $choosing) }
+            ToolbarItem(placement: .navigation) { HStack(spacing: 8) { ProjectPickers(choosing: $choosing) } }
             ToolbarItem(placement: .principal) {
                 Picker("View", selection: $showHistory) {
                     Text("Devices").tag(false)
@@ -81,9 +87,6 @@ struct ContentView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button { Task { await engine.tick() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                     .help("Look for devices and new commits now")
-                    .disabled(engine.busy || engine.project == nil)
-                Button { engine.buildNow() } label: { Label("Build Now", systemImage: "hammer") }
-                    .help("Rebuild the latest commit for every connected device")
                     .disabled(engine.busy || engine.project == nil)
                 SettingsLink { Label("Settings", systemImage: "gearshape") }
                     .help("Project settings")
@@ -112,31 +115,140 @@ struct ProjectPickers: View {
             Button("Add Project…") { choosing = true }
         } label: {
             Label(engine.project?.name ?? "Choose Project", systemImage: "folder").labelStyle(.titleAndIcon)
+                .lineLimit(1)
+                .fixedSize()
         }
         .disabled(engine.busy)
         .help("Project to watch")
 
         if engine.project != nil {
-            Menu {
-                Picker("Branch", selection: Binding(get: { branch }, set: { engine.setBranch($0) })) {
-                    ForEach(branches, id: \.self) { Text($0).tag($0) }
-                }
-                .pickerStyle(.inline)
-            } label: {
-                Label(branch, systemImage: "arrow.triangle.branch").labelStyle(.titleAndIcon)
-            }
-            .disabled(engine.busy)
-            .help("Branch to build from")
+            BranchPicker(branch: branch, branches: branches)
         }
+    }
+}
+
+/// Branch button that opens a small searchable list. A project can have hundreds of branches,
+/// which a plain menu would stretch across the whole screen.
+struct BranchPicker: View {
+    @Environment(Engine.self) private var engine
+    let branch: String
+    let branches: [String]
+    @State private var open = false
+    @State private var query = ""
+    @FocusState private var searching: Bool
+
+    private var matches: [String] {
+        // the branch in use first, so it is visible without scrolling
+        let ordered = [branch] + branches.filter { $0 != branch }
+        return query.isEmpty ? ordered : ordered.filter { $0.localizedCaseInsensitiveContains(query) }
+    }
+
+    private func choose(_ name: String) {
+        open = false
+        if name != branch { engine.setBranch(name) }
+    }
+
+    var body: some View {
+        Button { query = ""; open = true } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.branch")
+                Text(branch).lineLimit(1).truncationMode(.middle)
+                Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: 280)
+            .fixedSize()
+        }
+        .help("Branch to build from: \(branch)")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            VStack(spacing: 0) {
+                TextField("Search branches", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($searching)
+                    .onSubmit { if let first = matches.first { choose(first) } }
+                    .padding(10)
+                Divider()
+                if matches.isEmpty {
+                    ContentUnavailableView.search(text: query).frame(maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(matches, id: \.self) { name in
+                                BranchRow(name: name, current: name == branch) { choose(name) }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+                Divider()
+                Text(query.isEmpty ? "\(branches.count) branches" : "\(matches.count) of \(branches.count) branches")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.vertical, 6)
+            }
+            .frame(width: 340, height: 380)
+            // A popover opened from the toolbar doesn't take the keyboard by itself, so typing went nowhere
+            // until you clicked the field. Make its window key, then focus the search field.
+            .background(KeyWindow())
+        }
+    }
+}
+
+/// Gives the window it lands in the keyboard, with the cursor in its first text field.
+private struct KeyWindow: NSViewRepresentable {
+    final class View: NSView {
+        override func viewDidMoveToWindow() {
+            // once the popover has finished appearing: take the keyboard and put the cursor in its text field
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let window = self?.window else { return }
+                window.makeKey()
+                if let field = Self.textField(in: window.contentView) { window.makeFirstResponder(field) }
+            }
+        }
+        private static func textField(in view: NSView?) -> NSTextField? {
+            guard let view else { return nil }
+            if let field = view as? NSTextField, field.isEditable { return field }
+            return view.subviews.lazy.compactMap { textField(in: $0) }.first
+        }
+    }
+    func makeNSView(context: Context) -> View { View() }
+    func updateNSView(_ view: View, context: Context) {}
+}
+
+/// One branch in the picker: the whole row is the click target and lights up under the pointer.
+struct BranchRow: View {
+    let name: String
+    let current: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark").font(.caption.weight(.bold)).opacity(current ? 1 : 0)
+            Text(name).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(hovering ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+        .background(hovering ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.clear), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, 6)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture(perform: action)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(.default, action)
     }
 }
 
 /// The newest commit, how many devices have it, and what the app is doing right now.
 struct SummaryHeader: View {
+    @Environment(Engine.self) private var engine
     let sha: String?
     let subject: String
     let status: String
     let busy: Bool
+    let paused: Bool
     let failed: Bool
     let checked: Date?
     let devices: [Device]
@@ -159,8 +271,8 @@ struct SummaryHeader: View {
                         ProgressView().controlSize(.small)
                         Text(status)
                     } else {
-                        Image(systemName: failed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                            .foregroundStyle(failed ? .orange : .green)
+                        Image(systemName: failed ? "exclamationmark.triangle.fill" : paused ? "pause.circle.fill" : "checkmark.circle.fill")
+                            .foregroundStyle(failed ? AnyShapeStyle(.orange) : paused ? AnyShapeStyle(.secondary) : AnyShapeStyle(.green))
                         Text(status)
                         if let checked {
                             Text("· checked \(checked, format: .relative(presentation: .named))")
@@ -170,7 +282,8 @@ struct SummaryHeader: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
-            Spacer()
+            Spacer(minLength: 12)
+            RunControls(busy: busy, paused: paused, ready: sha != nil)
             if sha != nil, !devices.isEmpty {
                 VStack(spacing: 0) {
                     Text("\(onLatest)/\(devices.count)")
@@ -183,6 +296,41 @@ struct SummaryHeader: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+}
+
+/// Start, Stop and Build. Start is the highlighted one while automatic builds are stopped,
+/// which is the state a branch change leaves the project in.
+struct RunControls: View {
+    @Environment(Engine.self) private var engine
+    let busy: Bool
+    let paused: Bool
+    let ready: Bool   // a commit has been read
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Group {
+                if paused && !busy {
+                    Button { engine.start() } label: { Label("Start", systemImage: "play.fill") }
+                        .buttonStyle(.borderedProminent)
+                } else {
+                    Button { engine.start() } label: { Label("Start", systemImage: "play.fill") }
+                        .buttonStyle(.bordered)
+                }
+            }
+            .disabled(busy || !paused)
+            .help("Build and install new commits automatically")
+
+            Button { engine.stop() } label: { Label("Stop", systemImage: "stop.fill") }
+                .disabled(!busy && paused)
+                .help(busy ? "Stop what is running, and stop automatic builds" : "Stop automatic builds")
+
+            Button { engine.buildNow() } label: { Label("Build", systemImage: "hammer.fill") }
+                .disabled(busy || !ready)
+                .help("Build the latest commit now, without installing it")
+        }
+        .labelStyle(.titleAndIcon)
+        .fixedSize()
     }
 }
 
@@ -199,13 +347,13 @@ struct DeviceList: View {
             List {
                 if !online.isEmpty {
                     Section("Connected") {
-                        ForEach(online) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy,
+                        ForEach(online) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy, paused: engine.paused,
                                                     supported: engine.project?.command($0.platform).isEmpty == false) }
                     }
                 }
                 if !offline.isEmpty {
                     Section("Offline") {
-                        ForEach(offline) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy,
+                        ForEach(offline) { DeviceRow(device: $0, latest: engine.latestSHA, busy: engine.busy, paused: engine.paused,
                                                     supported: engine.project?.command($0.platform).isEmpty == false) }
                     }
                 }
@@ -268,6 +416,7 @@ struct DeviceRow: View {
     let device: Device
     let latest: String?
     let busy: Bool
+    let paused: Bool      // automatic builds are stopped, so nothing will install by itself
     let supported: Bool   // false when the project has no build command for this device's platform
 
     private var isLatest: Bool { latest != nil && device.installedSHA == latest }
@@ -277,7 +426,7 @@ struct DeviceRow: View {
     private var note: String? {
         if !supported { return "This project has no \(device.platform.label) build command. Add one in Settings." }
         if let error = device.error { return error }
-        guard let latest, device.installedSHA != latest, device.auto, !device.installing else { return nil }
+        guard let latest, device.installedSHA != latest, device.auto, !device.installing, !paused else { return nil }
         return device.online ? "Will install \(latest.prefix(7)) on the next check" : "Will get \(latest.prefix(7)) when it reconnects"
     }
 
@@ -365,6 +514,9 @@ struct DeviceRow: View {
         }
         .padding(.vertical, 5)
         .opacity(device.online ? 1 : 0.55)
+        // by default the line starts wherever the row's first text happens to be, so rows disagree
+        .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+        .alignmentGuide(.listRowSeparatorTrailing) { $0.width }
         .contextMenu {
             Button("Forget This Device", role: .destructive) { engine.forget(device.id) }
         }
@@ -418,6 +570,8 @@ struct HistoryRow: View {
             .help(isLatest ? "Install this build" : "Install this older build. Auto is turned off for the device so it stays on it.")
         }
         .padding(.vertical, 4)
+        .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+        .alignmentGuide(.listRowSeparatorTrailing) { $0.width }
     }
 }
 
