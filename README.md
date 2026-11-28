@@ -6,7 +6,7 @@ A Mac menu-bar app that watches a Git branch of your mobile app project and, eve
 
 Merge a pull request, pick up your phone, and the new build is already there. Works with Flutter, React Native, native iOS (Swift) and native Android (Kotlin) projects, and anything else you can build from a command line.
 
-![Shipyard's device list: each device shows its connection, installed commit and whether it has the latest build](docs/devices.jpg)
+![Shipyard's main window: Start, Stop and Build buttons beside the latest commit, and a list of devices showing each one's connection, installed commit and whether it has the latest build](docs/devices.jpg)
 
 ## What it does
 
@@ -67,7 +67,9 @@ Three buttons sit next to the latest commit:
 | **Stop** | Stops whatever is running and stops automatic builds until you press Start. Shipyard keeps checking for commits and devices. |
 | **Build** | Builds the latest commit now, without installing it. |
 
-Changing the branch never starts a build. Shipyard shows the new branch's latest commit and waits, with Start highlighted, until you press Start or Build. To install on one device, use its Install button.
+![The branch picker: a search field above a short list of branches, with the current one ticked](docs/branch-picker.jpg)
+
+Pick the branch from the toolbar; the list is searchable. Changing the branch never starts a build. Shipyard shows the new branch's latest commit and waits, with Start highlighted, until you press Start or Build. To install on one device, use its Install button.
 
 ## Project types
 
