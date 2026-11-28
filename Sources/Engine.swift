@@ -469,7 +469,13 @@ final class Engine {
     private func refreshDevices() async {
         let x = await sh("xcrun xcdevice list --timeout 5 2>/dev/null", quiet: true, timeout: 60)
         let sim = await sh("xcrun simctl list devices booted -j 2>/dev/null", quiet: true, timeout: 60)
-        let a = await sh("adb devices -l 2>/dev/null", quiet: true, timeout: 60)
+        var a = await sh("adb devices -l 2>/dev/null", quiet: true, timeout: 60)
+        if Self.parseAdb(a.out).isEmpty, let phone = await phoneAdbMissed() {
+            // adb's background server sometimes stops noticing phones (after sleep or a network change); restarting it is the cure.
+            lastAdbRestart = .now
+            append("[Android connection service restarted: it had stopped seeing \(phone)]\n")
+            a = await sh("adb kill-server; adb start-server && sleep 3 && adb devices -l 2>/dev/null", quiet: true, timeout: 60)
+        }
         guard x.ok || sim.ok || a.ok else { return }
         let seen = Self.parseXcdevice(x.out) + Self.parseSimctl(sim.out) + Self.parseAdb(a.out)
         for i in devices.indices { devices[i].online = false }
@@ -481,6 +487,28 @@ final class Engine {
             } else {
                 devices.append(s)
             }
+        }
+    }
+
+    private var lastAdbRestart = Date.distantPast
+
+    /// The name of a known Wi-Fi Android phone that is announcing itself on the network although adb lists nothing.
+    /// ponytail: only acts when adb lists no device at all, and at most every five minutes, because a restart
+    /// drops every adb session on the Mac (Android Studio, flutter run). Loosen if a stale server with other devices attached shows up.
+    private func phoneAdbMissed() async -> String? {
+        // skip the three-second network browse unless a Wi-Fi Android phone has ever been seen
+        guard devices.contains(where: { $0.id.contains("._adb-tls-connect") }), Date().timeIntervalSince(lastAdbRestart) > 300 else { return nil }
+        // dns-sd never exits by itself; the time limit ends it. Not through sh(), so the expected timeout isn't logged.
+        let bonjour = await runShell("dns-sd -B _adb-tls-connect._tcp local.", env: await environment(), cwd: nil, timeout: 3).out
+        return Self.announced(devices, in: bonjour)?.name
+    }
+
+    /// The first of `phones` whose wireless-debugging service name appears in `dns-sd -B` output.
+    nonisolated static func announced(_ phones: [Device], in bonjour: String) -> Device? {
+        phones.first { phone in
+            // a Wi-Fi phone's adb ID is "<service name>._adb-tls-connect._tcp"
+            guard let end = phone.id.range(of: "._adb-tls-connect") else { return false }
+            return bonjour.contains(phone.id[..<end.lowerBound])
         }
     }
 
@@ -917,6 +945,12 @@ func selftest() async {
     """)
     precondition(adb.map(\.name) == ["Galaxy S24", "Pixel 9", "sdk gphone64 arm64"])
     precondition(adb.map(\.connection) == [.wireless, .wired, .simulator] && adb.map(\.auto) == [true, true, false])
+
+    // A stale adb server: the Wi-Fi phone is announcing itself, the USB one can't be judged this way.
+    let browse = "11:35:51.272  Add  2  15 local.  _adb-tls-connect._tcp. adb-ABC123"
+    precondition(Engine.announced(adb, in: browse)?.name == "Galaxy S24")
+    precondition(Engine.announced(adb, in: "11:35:51.272  ...STARTING...") == nil)
+    precondition(Engine.announced([adb[1]], in: browse) == nil)
 
     var x = i[0]
     precondition(x.needsInstall(built: "abc") && !x.needsInstall(built: nil))

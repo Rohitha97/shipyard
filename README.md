@@ -124,6 +124,7 @@ Every new build is then uploaded and the group is notified. iOS uploads use the 
 - Commands run with the environment of your login shell, including what `~/.zshrc` sets up, and are stopped if they run longer than an hour.
 - Removing a project from Shipyard deletes its build copy and kept builds, never your project folder.
 - Devices are found with Xcode's tools and `adb`, so the list is the same whatever the project is built with.
+- If `adb` stops noticing a Wi-Fi phone that is still announcing itself on the network, Shipyard restarts the adb server (at most every five minutes, and only when adb lists no devices). This briefly drops other adb sessions on the Mac.
 - iOS apps can only be built on a Mac, and Shipyard itself is Mac-only.
 
 ## Security
